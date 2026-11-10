@@ -1,0 +1,58 @@
+# Asset tag: 60 x 25 mm plate, outline cut as vector, ID as raster text, QR code.
+# Burn a different ID:  k4laser burn examples/asset-tag.toml --set id=PUMP-0043
+
+[variables]
+id = "PUMP-0042"
+
+[[op]]
+name = "outline"
+mode = "vector"
+x_mm = 5.0
+y_mm = 5.0
+power = 100
+depth = 40
+passes = 1
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 60.0
+height_mm = 25.0
+
+[[op]]
+name = "id"
+mode = "raster"
+x_mm = 8.0
+y_mm = 9.0
+power = 100
+depth = 15
+[op.source]
+type = "text"
+text = "${id}"
+font = "DejaVu Sans Mono Bold"
+size_mm = 5.0
+
+[[op]]
+name = "site"
+mode = "raster"
+x_mm = 8.0
+y_mm = 19.0
+power = 80
+depth = 10
+[op.source]
+type = "text"
+text = "Line 3 · Hall B"
+font = "DejaVu Sans"
+size_mm = 3.0
+
+[[op]]
+name = "qr"
+mode = "raster"
+x_mm = 46.0
+y_mm = 8.0
+power = 100
+depth = 15
+[op.source]
+type = "qr"
+data = "https://example.com/asset/${id}"
+module_mm = 0.6
+ecc = "M"

@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get install -y --no-install-recommends fonts-dejavu-core  # tests render text
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    # Debian 12 (glibc 2.36): the binary then runs on any current distribution
+    container: debian:bookworm
+    permissions:
+      contents: write
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev git
+      - uses: actions/checkout@v5
+      - run: curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
+          cp target/release/k4laser k4laser-x86_64-linux
+          sha256sum k4laser-x86_64-linux > k4laser-x86_64-linux.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            k4laser-x86_64-linux
+            k4laser-x86_64-linux.sha256

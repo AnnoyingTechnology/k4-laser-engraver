@@ -1,0 +1,573 @@
+# Power x depth calibration grid, written by `k4laser testgrid`.
+# Columns: power % (20-100); rows: depth (5-80). Burn on scrap of the target
+# material and pick the lightest cell that gives the contrast you need.
+
+[[op]]
+name = "label P20"
+mode = "raster"
+x_mm = 6.02
+y_mm = 1.0
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "20"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "label P40"
+mode = "raster"
+x_mm = 11.52
+y_mm = 1.0
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "40"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "label P60"
+mode = "raster"
+x_mm = 17.02
+y_mm = 1.0
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "60"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "label P80"
+mode = "raster"
+x_mm = 22.52
+y_mm = 1.0
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "80"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "label P100"
+mode = "raster"
+x_mm = 28.02
+y_mm = 1.0
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "100"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "label D5"
+mode = "raster"
+x_mm = 1.0
+y_mm = 5.3
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "5"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "cell P20 D5"
+mode = "raster"
+x_mm = 6.02
+y_mm = 4.1
+power = 20.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P40 D5"
+mode = "raster"
+x_mm = 11.52
+y_mm = 4.1
+power = 40.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P60 D5"
+mode = "raster"
+x_mm = 17.02
+y_mm = 4.1
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P80 D5"
+mode = "raster"
+x_mm = 22.52
+y_mm = 4.1
+power = 80.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P100 D5"
+mode = "raster"
+x_mm = 28.02
+y_mm = 4.1
+power = 100.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "label D10"
+mode = "raster"
+x_mm = 1.0
+y_mm = 10.8
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "10"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "cell P20 D10"
+mode = "raster"
+x_mm = 6.02
+y_mm = 9.6
+power = 20.0
+depth = 10
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P40 D10"
+mode = "raster"
+x_mm = 11.52
+y_mm = 9.6
+power = 40.0
+depth = 10
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P60 D10"
+mode = "raster"
+x_mm = 17.02
+y_mm = 9.6
+power = 60.0
+depth = 10
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P80 D10"
+mode = "raster"
+x_mm = 22.52
+y_mm = 9.6
+power = 80.0
+depth = 10
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P100 D10"
+mode = "raster"
+x_mm = 28.02
+y_mm = 9.6
+power = 100.0
+depth = 10
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "label D20"
+mode = "raster"
+x_mm = 1.0
+y_mm = 16.3
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "20"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "cell P20 D20"
+mode = "raster"
+x_mm = 6.02
+y_mm = 15.1
+power = 20.0
+depth = 20
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P40 D20"
+mode = "raster"
+x_mm = 11.52
+y_mm = 15.1
+power = 40.0
+depth = 20
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P60 D20"
+mode = "raster"
+x_mm = 17.02
+y_mm = 15.1
+power = 60.0
+depth = 20
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P80 D20"
+mode = "raster"
+x_mm = 22.52
+y_mm = 15.1
+power = 80.0
+depth = 20
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P100 D20"
+mode = "raster"
+x_mm = 28.02
+y_mm = 15.1
+power = 100.0
+depth = 20
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "label D40"
+mode = "raster"
+x_mm = 1.0
+y_mm = 21.8
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "40"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "cell P20 D40"
+mode = "raster"
+x_mm = 6.02
+y_mm = 20.6
+power = 20.0
+depth = 40
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P40 D40"
+mode = "raster"
+x_mm = 11.52
+y_mm = 20.6
+power = 40.0
+depth = 40
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P60 D40"
+mode = "raster"
+x_mm = 17.02
+y_mm = 20.6
+power = 60.0
+depth = 40
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P80 D40"
+mode = "raster"
+x_mm = 22.52
+y_mm = 20.6
+power = 80.0
+depth = 40
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P100 D40"
+mode = "raster"
+x_mm = 28.02
+y_mm = 20.6
+power = 100.0
+depth = 40
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "label D80"
+mode = "raster"
+x_mm = 1.0
+y_mm = 27.3
+power = 60.0
+depth = 5
+passes = 1
+enabled = true
+
+[op.source]
+type = "text"
+text = "80"
+font = "DejaVu Sans Mono"
+size_mm = 1.6
+align = "left"
+
+[[op]]
+name = "cell P20 D80"
+mode = "raster"
+x_mm = 6.02
+y_mm = 26.1
+power = 20.0
+depth = 80
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P40 D80"
+mode = "raster"
+x_mm = 11.52
+y_mm = 26.1
+power = 40.0
+depth = 80
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P60 D80"
+mode = "raster"
+x_mm = 17.02
+y_mm = 26.1
+power = 60.0
+depth = 80
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P80 D80"
+mode = "raster"
+x_mm = 22.52
+y_mm = 26.1
+power = 80.0
+depth = 80
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0
+
+[[op]]
+name = "cell P100 D80"
+mode = "raster"
+x_mm = 28.02
+y_mm = 26.1
+power = 100.0
+depth = 80
+passes = 1
+enabled = true
+
+[op.source]
+type = "shape"
+shape = "rect"
+width_mm = 4.0
+height_mm = 4.0

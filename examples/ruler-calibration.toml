@@ -1,0 +1,16 @@
+# Scale check: 70 mm ruler along X, 1 mm ticks, labels every 10 mm.
+# Measure 0-70 with calipers. To check Y, turn the piece 90 deg and burn again.
+[[op]]
+name = "ruler 70 mm"
+mode = "vector"
+x_mm = 4.0
+y_mm = 3.0
+power = 100
+depth = 20
+[op.source]
+type = "ruler"
+length_mm = 70.0
+step_mm = 1.0
+labels = true
+font = "DejaVu Sans"
+label_mm = 1.8

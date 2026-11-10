@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=k4laser
+GenericName=Laser Engraver
+Comment=Frame and engrave with K4 USB mini laser engravers
+Exec=k4laser gui %f
+Terminal=false
+Icon=applications-engineering
+Categories=Graphics;Engineering;
+Keywords=laser;engraver;engraving;K4;CNC;DXF;QR;
+MimeType=application/toml;
