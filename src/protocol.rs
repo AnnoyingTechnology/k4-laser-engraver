@@ -395,7 +395,9 @@ impl Frame {
                 depth: self.u16_at(3),
                 power: self.u16_at(5),
                 segments: d[7..]
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let u = |i: usize| u16::from_be_bytes([c[i], c[i + 1]]);
                         [u(0), u(2), u(4), u(6)]

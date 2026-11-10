@@ -96,12 +96,12 @@ struct Parsed {
 fn parse(text: &str) -> Result<Parsed> {
     let lines: Vec<&str> = text.lines().collect();
     let mut pairs = Vec::with_capacity(lines.len() / 2);
-    for c in lines.chunks_exact(2) {
-        let code: i32 = match c[0].trim().parse() {
+    for [code, value] in lines.as_chunks::<2>().0 {
+        let code: i32 = match code.trim().parse() {
             Ok(v) => v,
-            Err(_) => bail!("malformed group code {:?}", c[0].trim()),
+            Err(_) => bail!("malformed group code {:?}", code.trim()),
         };
-        pairs.push((code, c[1].trim().to_string()));
+        pairs.push((code, value.trim().to_string()));
     }
     let mut p = Parsed { header: HashMap::new(), blocks: HashMap::new(), entities: Vec::new() };
     let mut section: Option<String> = None;
