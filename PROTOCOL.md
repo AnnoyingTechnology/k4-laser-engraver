@@ -96,6 +96,25 @@ Segments are relative to the START origin. The vendor sends them in batches of
 640 coordinate bytes, which is 80 segments. **[vendor]** `k4laser` orders
 polylines nearest-neighbour to shorten travel moves.
 
+Two marker segments switch the laser, with all four coordinates set to the
+code: `50001` (`0xC351`) = laser on, `50000` (`0xC350`) = laser off. The
+vendor G-code import maps `M3` to 50001 and `M5` to 50000. Its path tracer
+emits `ON path OFF move ON path … OFF`, where `move` is a segment from the end
+of one path to the start of the next. Markers count toward the 80 segments of
+a batch, and a batch boundary may fall anywhere. **[vendor]**
+
+Without markers, the machine burns the moves between disjoint segments. **[hw]**
+`k4laser` uses the vendor layout, reaches the first path with the laser off,
+and ends with a laser-off move back to the job origin (see Sequences):
+
+```
+OFF  (x0 y0 x0 y0)  ON  path…  OFF  (end → next start)  ON  path…  OFF  (end → 0 0)
+```
+
+`simulate` replays this model: the laser is on after `START`, and every head
+move burns while it is on. Whether the head moves to a segment's start or
+ignores it is unknown. **[?]**
+
 ### Settings (`0x28`)
 
 The defaults are the values shipped in the vendor `pei_zhi.ini`. The names
@@ -178,14 +197,29 @@ and waiting 400 ms on each for an ACK. **[vendor]** Writing binary data to an
 unrelated serial device is unsafe, so `k4laser` never does this: it only
 opens the port it is given. It retries `HANDSHAKE` three times, 0.5 s apart.
 
-Online job, per operation and per pass:
+Online job, per operation:
 
 ```
 MOVE_REL to (x, y) → RESET → START x y → data frames (each ACKed) → STOP
 ```
 
-After `STOP`, `k4laser` treats the head position as unknown and homes before
-the next absolute positioning. **[sim]**
+The vendor sends `RESET → START` and the data with the head already at the
+artwork: it moves the head with `MOVE_REL` whenever the artwork moves on the
+canvas, and never homes between jobs. It assumes that after a job the head is
+back at the job origin. **[vendor]**
+
+A second pass sent as a new job (`STOP → HOME → MOVE_REL → RESET → START`)
+landed shifted from the first, which matched the framing. **[hw]** So
+`k4laser` follows the vendor:
+
+- Passes repeat inside one job. Each raster row is sent `passes` times in a
+  row, with the same row index **[?]**, and the vector paths are traced
+  `passes` times over, with laser-off moves in between.
+- After a job, the head is taken to be at the job origin, and the next job or
+  framing moves relative to it. Vector jobs end there explicitly. Where a
+  raster job leaves the head is unconfirmed. **[?]**
+- The head homes only when its position is unknown: before the first move,
+  and after an abort or error.
 
 Framing:
 
@@ -197,8 +231,9 @@ MOVE_REL to (x, y) → FRAME_ON w h 0 0 … FRAME_OFF
 
 - Are `START` coordinates absolute, or relative to the head position?
 - What is the unit of `depth`, and how does it interact with `line_delay`?
-- How exactly does the device behave after `STOP`? Does it hold or lose its
-  position?
+- How exactly does the device behave after `STOP`? Where is the head after a
+  raster job, and after an abort? Why did homing after a vector job shift the
+  next one?
 - What do `0xFD` / `0xFE` do?
 - What are the work areas of other model codes?
 

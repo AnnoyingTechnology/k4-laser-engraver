@@ -7,30 +7,49 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::geom::{self, Side};
 use crate::plan::{Geometry, OpPlan, Plan, segments_from_polylines};
 use crate::protocol::{self as P};
-use crate::sources::{self, Artwork, Mode, ShapeKind, ShapeSrc, Source, TextSrc, mm2px};
+use crate::sources::{self, Artwork, ImageProcess, Mode, ShapeKind, ShapeSrc, Source, TextSrc, mm2px};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operation {
     #[serde(default)]
     pub name: String,
+    /// Raster fills areas ("Fill"); vector follows paths ("Line").
     #[serde(default)]
     pub mode: Mode,
-    /// Top-left of the burnt area, from the work-area origin.
+    /// Top-left of the artwork, from the work-area origin.
     #[serde(default)]
     pub x_mm: f64,
     #[serde(default)]
     pub y_mm: f64,
-    /// Percent, 0.1 resolution on the wire.
+    /// Percent, 0.1 resolution on the wire. Grayscale images: power of the darkest tone.
     #[serde(default = "default_power")]
     pub power: f64,
-    /// Vendor "carving depth" 0..100 (dwell; unit unknown).
+    /// Grayscale images: power of the lightest tone, percent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_power: f64,
+    /// Vendor "carving depth" 0..100: dwell per pixel (unit unknown).
     #[serde(default = "default_depth")]
     pub depth: u16,
+    /// Repeat the whole operation (deeper cut).
     #[serde(default = "default_passes")]
     pub passes: u32,
+    /// Line mode: concentric perimeters, like the walls of a 3D print (wider cut).
+    #[serde(default = "default_passes", skip_serializing_if = "is_one")]
+    pub outlines: u32,
+    #[serde(default = "default_spacing", skip_serializing_if = "is_default_spacing")]
+    pub outline_spacing_mm: f64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub outline_side: Side,
+    /// Clockwise quarter turns, degrees (0, 90, 180, 270), applied after `mirror`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rotate: u16,
+    /// Left-right mirror.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mirror: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub source: Source,
@@ -45,8 +64,23 @@ fn default_depth() -> u16 {
 fn default_passes() -> u32 {
     1
 }
+fn default_spacing() -> f64 {
+    0.1
+}
 fn default_true() -> bool {
     true
+}
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+fn is_one(v: &u32) -> bool {
+    *v == 1
+}
+fn is_default_spacing(v: &f64) -> bool {
+    *v == default_spacing()
+}
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 impl Operation {
@@ -58,8 +92,14 @@ impl Operation {
             x_mm: 0.0,
             y_mm: 0.0,
             power: default_power(),
+            min_power: 0.0,
             depth: default_depth(),
             passes: 1,
+            outlines: 1,
+            outline_spacing_mm: default_spacing(),
+            outline_side: Side::default(),
+            rotate: 0,
+            mirror: false,
             enabled: true,
             source,
         }
@@ -76,19 +116,29 @@ impl Operation {
         self
     }
 
+    /// Grayscale image: one pass per tone.
+    pub fn is_grayscale(&self) -> bool {
+        matches!(&self.source, Source::Image(s) if s.process == ImageProcess::Grayscale)
+    }
+
     pub fn label(&self) -> String {
         if !self.name.is_empty() {
             return self.name.clone();
         }
+        let short = |s: &str| {
+            let s = s.lines().next().unwrap_or_default();
+            if s.chars().count() > 24 {
+                format!("{}…", s.chars().take(23).collect::<String>())
+            } else {
+                s.to_string()
+            }
+        };
         match &self.source {
-            Source::Text(t) => format!("text “{}”", t.text),
+            Source::Text(t) => format!("“{}”", short(&t.text)),
+            Source::Qr(q) => format!("QR {}", short(&q.data)),
             s => match s.path().filter(|p| !p.is_empty()) {
-                Some(p) => format!(
-                    "{} {}",
-                    s.kind(),
-                    Path::new(p).file_name().map(|f| f.to_string_lossy()).unwrap_or_default()
-                ),
-                None => s.kind().to_string(),
+                Some(p) => Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                None => s.title().to_string(),
             },
         }
     }
@@ -135,8 +185,17 @@ impl Job {
 #[derive(Debug)]
 pub struct Prepared {
     pub notes: Vec<String>,
-    /// `None` when the artwork is blank.
-    pub shape: Option<Shape>,
+    /// Artwork box in mm from (x_mm, y_mm): x, y, width, height. `None` when empty.
+    pub frame: Option<[f64; 4]>,
+    /// What actually burns; empty when nothing does.
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Part {
+    pub shape: Shape,
+    /// Grayscale tone k of n (1 = lightest).
+    pub tone: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +209,8 @@ pub struct Shape {
     pub hash: u64,
 }
 
-/// Prepared geometry keyed on the substituted source, mode and file mtime:
-/// moving an operation or changing its power never re-renders it.
+/// Prepared geometry keyed on everything that changes it: moving an operation
+/// or changing its power never re-renders it.
 #[derive(Default)]
 pub struct GeometryCache {
     map: HashMap<String, Arc<Prepared>>,
@@ -160,18 +219,34 @@ pub struct GeometryCache {
 impl GeometryCache {
     pub fn get(&mut self, op: &Operation, base_dir: &Path, vars: &BTreeMap<String, String>) -> Result<Arc<Prepared>> {
         let src = op.source.substituted(vars);
+        let perimeters = if op.mode == Mode::Vector && op.outlines > 1 {
+            format!("{}x{}{:?}", op.outlines, op.outline_spacing_mm, op.outline_side)
+        } else {
+            String::new()
+        };
         let key = format!(
-            "{}|{}|{:?}|{}",
+            "{}|{}|{:?}|{}|{perimeters}|{}{}",
             toml::to_string(&src).unwrap_or_default(),
             op.mode.as_str(),
             sources::source_mtime(&src, base_dir),
-            base_dir.display()
+            base_dir.display(),
+            op.rotate,
+            op.mirror
         );
         if let Some(r) = self.map.get(&key) {
             return Ok(r.clone());
         }
+        if !op.rotate.is_multiple_of(90) {
+            bail!("rotate must be 0, 90, 180 or 270");
+        }
         let rendered = sources::render(&src, op.mode, base_dir)?;
-        let prepared = Arc::new(Prepared { shape: quantise(&rendered.art), notes: rendered.notes });
+        let mut art = rendered.art;
+        if let Artwork::Vector(polys) = art {
+            art = Artwork::Vector(geom::perimeters(polys, op.outlines, op.outline_spacing_mm, op.outline_side));
+        }
+        let art = geom::transform(art, op.mirror, op.rotate);
+        let (frame, parts) = quantise(&art);
+        let prepared = Arc::new(Prepared { frame, parts, notes: rendered.notes });
         if self.map.len() > 64 {
             self.map.clear();
         }
@@ -180,12 +255,35 @@ impl GeometryCache {
     }
 }
 
+fn raster_shape(bm: &crate::plan::Bitmap) -> Option<Shape> {
+    let ((cx, cy), crop) = bm.crop_to_ink()?;
+    let geometry = Geometry::Raster(crop);
+    let (w, h) = match &geometry {
+        Geometry::Raster(c) => (c.width as u32, c.height as u32),
+        Geometry::Vector(_) => unreachable!(),
+    };
+    let hash = geometry.hash64();
+    Some(Shape { dx: cx as i64, dy: cy as i64, w, h, geometry: Arc::new(geometry), hash })
+}
+
 /// Raster: crop to ink. Vector: mm -> px, drop repeats, order, split into segments.
-pub fn quantise(art: &Artwork) -> Option<Shape> {
-    let (dx, dy, w, h, geometry) = match art {
+pub fn quantise(art: &Artwork) -> (Option<[f64; 4]>, Vec<Part>) {
+    let p = P::PITCH_MM;
+    match art {
         Artwork::Raster(bm) => {
-            let ((cx, cy), crop) = bm.crop_to_ink()?;
-            (cx as i64, cy as i64, crop.width as u32, crop.height as u32, Geometry::Raster(crop))
+            let frame =
+                (bm.width > 0 && bm.height > 0).then_some([0.0, 0.0, bm.width as f64 * p, bm.height as f64 * p]);
+            (frame, raster_shape(bm).map(|shape| Part { shape, tone: None }).into_iter().collect())
+        }
+        Artwork::Levels(levels) => {
+            let n = levels.len() as u32;
+            let frame = levels.first().map(|bm| [0.0, 0.0, bm.width as f64 * p, bm.height as f64 * p]);
+            let parts = levels
+                .iter()
+                .enumerate()
+                .filter_map(|(k, bm)| raster_shape(bm).map(|shape| Part { shape, tone: Some((k as u32 + 1, n)) }))
+                .collect();
+            (frame, parts)
         }
         Artwork::Vector(polys) => {
             let mut px: Vec<Vec<(i64, i64)>> = Vec::new();
@@ -201,30 +299,39 @@ pub fn quantise(art: &Artwork) -> Option<Shape> {
                     px.push(pts);
                 }
             }
-            let x0 = px.iter().flatten().map(|p| p.0).min()?;
-            let y0 = px.iter().flatten().map(|p| p.1).min()?;
-            let x1 = px.iter().flatten().map(|p| p.0).max()?;
-            let y1 = px.iter().flatten().map(|p| p.1).max()?;
+            let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
+                px.iter().flatten().map(|p| p.0).min(),
+                px.iter().flatten().map(|p| p.1).min(),
+                px.iter().flatten().map(|p| p.0).max(),
+                px.iter().flatten().map(|p| p.1).max(),
+            ) else {
+                return (None, Vec::new());
+            };
             if x1 - x0 > u16::MAX as i64 || y1 - y0 > u16::MAX as i64 {
-                return None;
+                return (None, Vec::new());
             }
             let rel: Vec<Vec<(u16, u16)>> =
                 px.iter().map(|pl| pl.iter().map(|&(x, y)| ((x - x0) as u16, (y - y0) as u16)).collect()).collect();
             let segs = segments_from_polylines(&rel);
             let w = segs.iter().map(|s| s[0].max(s[2])).max().unwrap_or(0) as u32;
             let h = segs.iter().map(|s| s[1].max(s[3])).max().unwrap_or(0) as u32;
-            (x0, y0, w, h, Geometry::Vector(segs))
+            let frame = [x0 as f64 * p, y0 as f64 * p, w as f64 * p, h as f64 * p];
+            let geometry = Geometry::Vector(segs);
+            let hash = geometry.hash64();
+            let shape = Shape { dx: x0, dy: y0, w, h, geometry: Arc::new(geometry), hash };
+            (Some(frame), vec![Part { shape, tone: None }])
         }
-    };
-    let hash = geometry.hash64();
-    Some(Shape { dx, dy, w, h, geometry: Arc::new(geometry), hash })
+    }
 }
 
 /// Validate process parameters and place prepared geometry at the operation position.
-pub fn compile_op(op: &Operation, prepared: &Prepared) -> Result<Option<OpPlan>> {
+pub fn compile_op(op: &Operation, prepared: &Prepared) -> Result<Vec<OpPlan>> {
     let label = op.label();
     if !(0.0..=100.0).contains(&op.power) {
         bail!("{label}: power {} % outside 0..100", op.power);
+    }
+    if !(0.0..=op.power).contains(&op.min_power) {
+        bail!("{label}: minimum power {} % outside 0..{}", op.min_power, op.power);
     }
     if op.depth > P::DEPTH_MAX {
         bail!("{label}: depth {} outside 0..{}", op.depth, P::DEPTH_MAX);
@@ -232,27 +339,40 @@ pub fn compile_op(op: &Operation, prepared: &Prepared) -> Result<Option<OpPlan>>
     if !(1..=50).contains(&op.passes) {
         bail!("{label}: passes {} outside 1..50", op.passes);
     }
-    let Some(s) = &prepared.shape else { return Ok(None) };
-    let (x, y) = (mm2px(op.x_mm) + s.dx, mm2px(op.y_mm) + s.dy);
-    if x < 0 || y < 0 || x + s.w as i64 > u16::MAX as i64 || y + s.h as i64 > u16::MAX as i64 {
-        bail!(
-            "{label}: position ({:.2}, {:.2}) mm is outside the machine range",
-            x as f64 * P::PITCH_MM,
-            y as f64 * P::PITCH_MM
-        );
+    if !(1..=50).contains(&op.outlines) || op.outline_spacing_mm.is_nan() || op.outline_spacing_mm <= 0.0 {
+        bail!("{label}: outlines need a count of 1..50 and a positive spacing");
     }
-    Ok(Some(OpPlan {
-        name: label,
-        x: x as u32,
-        y: y as u32,
-        width: s.w,
-        height: s.h,
-        power: (op.power * 10.0).round() as u16,
-        depth: op.depth,
-        passes: op.passes,
-        geometry: s.geometry.clone(),
-        geom_hash: s.hash,
-    }))
+    let mut plans = Vec::with_capacity(prepared.parts.len());
+    for part in &prepared.parts {
+        let s = &part.shape;
+        let (x, y) = (mm2px(op.x_mm) + s.dx, mm2px(op.y_mm) + s.dy);
+        if x < 0 || y < 0 || x + s.w as i64 > u16::MAX as i64 || y + s.h as i64 > u16::MAX as i64 {
+            bail!(
+                "{label}: position ({:.2}, {:.2}) mm is outside the machine range",
+                x as f64 * P::PITCH_MM,
+                y as f64 * P::PITCH_MM
+            );
+        }
+        let (power, name) = match part.tone {
+            None => (op.power, label.clone()),
+            Some((k, n)) => {
+                (op.min_power + (op.power - op.min_power) * k as f64 / n as f64, format!("{label} · tone {k}/{n}"))
+            }
+        };
+        plans.push(OpPlan {
+            name,
+            x: x as u32,
+            y: y as u32,
+            width: s.w,
+            height: s.h,
+            power: (power * 10.0).round() as u16,
+            depth: op.depth,
+            passes: op.passes,
+            geometry: s.geometry.clone(),
+            geom_hash: s.hash,
+        });
+    }
+    Ok(plans)
 }
 
 /// Error message when `p` leaves the work area.
@@ -287,12 +407,14 @@ pub fn compile_job(
         }
         let prepared = cache.get(op, &job.base_dir, &job.variables).with_context(|| op.label())?;
         notes.extend(prepared.notes.iter().map(|n| format!("{}: {n}", op.label())));
-        let Some(p) = compile_op(op, &prepared)? else {
+        let plans = compile_op(op, &prepared)?;
+        if plans.is_empty() {
             notes.push(format!("{}: nothing to burn, skipped", op.label()));
-            continue;
-        };
-        check_area(&p, area_px)?;
-        plan.ops.push(p);
+        }
+        for p in plans {
+            check_area(&p, area_px)?;
+            plan.ops.push(p);
+        }
     }
     Ok((plan, notes))
 }

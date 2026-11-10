@@ -20,6 +20,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::plan::{Plan, Rect};
 use crate::protocol::{self as P, MachineSettings, Model};
+use crate::timing::{self, Timing};
 use crate::transport::Port;
 
 /// The job was stopped by the user; STOP has been sent.
@@ -89,6 +90,8 @@ pub struct Machine {
     /// One raster row or vector batch, i.e. its burn time.
     pub data_timeout: Duration,
     pub max_resends: u32,
+    /// Learns frame times during jobs when set (real machines only).
+    pub timing: Option<Timing>,
 }
 
 impl Machine {
@@ -105,6 +108,7 @@ impl Machine {
             motion_timeout: Duration::from_secs(30),
             data_timeout: Duration::from_secs(300),
             max_resends: 10,
+            timing: None,
         }
     }
 
@@ -322,24 +326,34 @@ impl Machine {
         let n_ops = plan.ops.len();
         for (index, op) in plan.ops.iter().enumerate() {
             let frames = op.frames()?;
-            for npass in 1..=op.passes {
-                let label = format!("op {}/{n_ops} “{}” pass {npass}/{}", index + 1, op.name, op.passes);
-                (self.log)(&format!("start {label}"));
-                self.move_to(op.x, op.y)?;
-                self.command(&P::reset(), None, None, false)?;
-                self.command(&P::start(op.x as i64, op.y as i64)?, None, None, false)?;
-                for frame in &frames {
-                    hold_while_paused(control)?;
-                    let t1 = Instant::now();
-                    self.command(frame, Some(self.data_timeout), Some(control), true)?;
-                    done += 1;
-                    busy += t1.elapsed();
-                    let eta = (done > 0).then(|| busy / done as u32 * (total - done) as u32);
-                    progress(Progress { step: done, total, label: label.clone(), elapsed: t0.elapsed(), eta });
-                }
-                self.send(&P::stop())?;
-                self.head = None;
+            let samples = timing::samples(&frames);
+            let passes = if op.passes > 1 { format!(", {} passes", op.passes) } else { String::new() };
+            let label = format!("op {}/{n_ops} “{}”{passes}", index + 1, op.name);
+            (self.log)(&format!("start {label}"));
+            let t_job = Instant::now();
+            self.move_to(op.x, op.y)?;
+            self.command(&P::reset(), None, None, false)?;
+            self.command(&P::start(op.x as i64, op.y as i64)?, None, None, false)?;
+            if let Some(t) = &mut self.timing {
+                t.record_setup(t_job.elapsed().as_secs_f64());
             }
+            for (frame, sample) in frames.iter().zip(&samples) {
+                hold_while_paused(control)?;
+                let t1 = Instant::now();
+                self.command(frame, Some(self.data_timeout), Some(control), true)?;
+                let dt = t1.elapsed();
+                if let Some(t) = &mut self.timing {
+                    t.record(sample, dt.as_secs_f64());
+                }
+                done += 1;
+                busy += dt;
+                let eta = (done > 0).then(|| busy / done as u32 * (total - done) as u32);
+                progress(Progress { step: done, total, label: label.clone(), elapsed: t0.elapsed(), eta });
+            }
+            self.send(&P::stop())?;
+            // Like the vendor, take the head to be back at the job origin (vector
+            // jobs end there). Homing after a job misplaced the next one. [hw]
+            self.head = Some((op.x, op.y));
         }
         Ok(())
     }

@@ -1,10 +1,14 @@
-//! Native GUI (egui/eframe): mm canvas, operations, properties, machine control.
+//! Native GUI (egui/eframe).
+//!
+//! One window: a top bar to add files and connect the engraver, the bed
+//! (always fitted and centred), the item list and the editor of the selected
+//! item on the right, and STOP / Frame / Start at the bottom.
 //!
 //! The machine lives on a worker thread that owns the port; the UI sends it
 //! commands and reads events. STOP and Pause go through shared atomics, so
 //! they act within 50 ms even while the worker waits for an ACK.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,14 +17,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, Key, KeyboardShortcut, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
 
 use crate::config::{self, Config};
+use crate::geom::Side;
 use crate::job::{self, GeometryCache, Job, Operation};
 use crate::machine::{Aborted, Control, Machine, Progress};
 use crate::plan::{Geometry, OpPlan, Plan, Rect};
 use crate::protocol::{self as P, MachineSettings, Model};
-use crate::sources::{Align, Mode, ShapeKind, Source};
+use crate::sources::{self, Align, DxfSrc, ImageProcess, ImageSrc, Mode, ShapeKind, ShapeSrc, Source, SvgSrc};
+use crate::timing::{self, Estimate, Timing};
 use crate::transport::{self, Port, PortInfo, SerialPort, SimulatedPort};
 
 pub fn run(job_path: Option<PathBuf>) -> Result<()> {
@@ -28,13 +34,32 @@ pub fn run(job_path: Option<PathBuf>) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("k4laser")
             .with_app_id("k4laser")
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1360.0, 880.0])
+            .with_min_inner_size([960.0, 620.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native("k4laser", options, Box::new(move |cc| Ok(Box::new(App::new(cc, job_path)))))
         .map_err(|e| anyhow!("GUI: {e}"))
 }
+
+const RED: Color32 = Color32::from_rgb(200, 35, 35);
+const GREEN: Color32 = Color32::from_rgb(40, 140, 70);
+const ORANGE: Color32 = Color32::from_rgb(225, 125, 30);
+const BLUE: Color32 = Color32::from_rgb(40, 120, 230);
+const ERROR: Color32 = Color32::from_rgb(215, 55, 50);
+const BED: Color32 = Color32::from_rgb(246, 242, 234);
+const LINE: Color32 = Color32::from_rgb(200, 40, 40);
+const BEAM: Color32 = Color32::from_rgb(235, 45, 35);
+
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"];
+const SVG_EXTS: &[&str] = &["svg", "svgz"];
+const DXF_EXTS: &[&str] = &["dxf"];
+
+const DEPTH_HINT: &str = "Dwell per dot: the vendor's \"carving depth\", 0-100 (unit unknown). Higher burns darker \
+                          and deeper. Calibrate with Add ▾ → Test grid.";
+const OUTLINE_HINT: &str = "Concentric copies of the path, like the walls of a 3D print. They widen the cut so that \
+                            a part comes out cleanly.";
 
 // ------------------------------------------------------------------ worker
 
@@ -48,7 +73,7 @@ impl PortChoice {
     fn label(&self) -> String {
         match self {
             PortChoice::Serial(p) => p.display().to_string(),
-            PortChoice::Simulator => "Simulator (no hardware)".into(),
+            PortChoice::Simulator => "the simulator".into(),
         }
     }
 }
@@ -60,6 +85,7 @@ enum Cmd {
     Jog(i64, i64),
     Frame(Rect),
     FrameStop,
+    Stop,
     Run(Arc<Plan>, Arc<Control>),
     Aux(bool),
 }
@@ -72,6 +98,7 @@ enum Event {
     Idle,
     Progress(Progress),
     JobDone(Result<(), String>),
+    Timing(Box<Timing>),
 }
 
 #[derive(Clone)]
@@ -127,9 +154,13 @@ fn handle(machine: &mut Option<Machine>, cmd: Cmd, out: &Out) -> Result<()> {
                 }
             };
             let mut m = Machine::new(port);
+            if matches!(choice, PortChoice::Serial(_)) {
+                m.timing = Some(timing::load());
+            }
             let o = out.clone();
             m.log = Box::new(move |s| o.send(Event::Log(s.to_string())));
-            let model = m.connect(Some(&settings), true)?;
+            // no homing: connecting never moves the head
+            let model = m.connect(Some(&settings), false)?;
             out.send(Event::Connected { model, port: m.port_name() });
             *machine = Some(m);
         }
@@ -146,6 +177,10 @@ fn handle(machine: &mut Option<Machine>, cmd: Cmd, out: &Out) -> Result<()> {
                 Cmd::Jog(dx, dy) => m.jog(dx, dy)?,
                 Cmd::Frame(r) => m.frame_start(r)?,
                 Cmd::FrameStop => m.frame_stop()?,
+                Cmd::Stop => {
+                    m.emergency_stop();
+                    out.send(Event::Log("STOP sent".into()));
+                }
                 Cmd::Aux(on) => {
                     let ack = m.aux(on)?;
                     out.send(Event::Log(format!(
@@ -157,9 +192,15 @@ fn handle(machine: &mut Option<Machine>, cmd: Cmd, out: &Out) -> Result<()> {
                 Cmd::Run(plan, control) => {
                     let o = out.clone();
                     let res = m.run(&plan, &control, |p| o.send(Event::Progress(p)));
+                    if let Some(t) = &m.timing {
+                        if let Err(e) = timing::save(t) {
+                            out.send(Event::Log(format!("timing not saved: {e:#}")));
+                        }
+                        out.send(Event::Timing(Box::new(t.clone())));
+                    }
                     let msg = match &res {
                         Ok(()) => Ok(()),
-                        Err(e) if e.is::<Aborted>() => Err("stopped by user — STOP sent".to_string()),
+                        Err(e) if e.is::<Aborted>() => Err("stopped — STOP sent".to_string()),
                         Err(e) => Err(format!("{e:#}")),
                     };
                     out.send(Event::JobDone(msg));
@@ -176,75 +217,178 @@ fn handle(machine: &mut Option<Machine>, cmd: Cmd, out: &Out) -> Result<()> {
     Ok(())
 }
 
-// --------------------------------------------------------------------- app
+// ------------------------------------------------------------------- model
 
+/// Compiled state of one item.
 #[derive(Default)]
-struct OpView {
-    plan: Option<OpPlan>,
+struct ItemView {
+    /// Artwork box on the bed, mm: x, y, width, height.
+    frame: Option<[f64; 4]>,
+    plans: Vec<OpPlan>,
     error: Option<String>,
     notes: Vec<String>,
+    duration: Option<Estimate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum FrameScope {
     Job,
-    Selection,
+    Item(usize),
 }
 
-struct View {
-    /// Screen points per mm.
-    zoom: f32,
-    /// Screen offset of the work-area origin from the canvas corner.
-    pan: Vec2,
-    fitted: bool,
-}
-
-struct Drag {
+/// Pending placement: once item `op` is compiled, move it so that the point at
+/// `frac` of its box lands on `at` (mm). `fit` first shrinks it into the bed.
+struct Fix {
     op: usize,
-    start_mm: (f64, f64),
-    start_pointer: Pos2,
+    at: (f64, f64),
+    frac: (f64, f64),
+    fit: bool,
 }
+
+enum Gesture {
+    Move {
+        op: usize,
+        start: (f64, f64),
+        frame: [f64; 4],
+        grab: (f64, f64),
+    },
+    /// `corner` is the dragged corner as a fraction of the box; the opposite one stays put.
+    Resize {
+        op: usize,
+        frame: [f64; 4],
+        corner: (f64, f64),
+        scale: (f64, f64),
+    },
+}
+
+enum Pending {
+    New,
+    Open(PathBuf),
+}
+
+/// Laser settings given to new items: the last ones used.
+#[derive(Clone, Copy)]
+struct Laser {
+    power: f64,
+    min_power: f64,
+    depth: u16,
+    passes: u32,
+}
+
+enum Action {
+    AddFiles,
+    AddSource(Source),
+    AddTestGrid,
+    ReplaceFile(usize),
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Duplicate(usize),
+    Delete(usize),
+    Reorder(usize, bool),
+    Undo,
+    Redo,
+    Connect(PortChoice),
+    Rescan,
+    Frame(FrameScope),
+    FrameStop,
+    Stop,
+    Center(usize),
+    Rotate(usize, u16),
+    Mirror(usize),
+    Resize(usize, f64, f64, (f64, f64)),
+    Machine(Cmd),
+}
+
+/// Bed mm ↔ screen.
+#[derive(Clone, Copy)]
+struct Tf {
+    origin: Pos2,
+    z: f64,
+}
+
+impl Tf {
+    fn pos(&self, x: f64, y: f64) -> Pos2 {
+        Pos2::new(self.origin.x + (x * self.z) as f32, self.origin.y + (y * self.z) as f32)
+    }
+    fn rect(&self, [x, y, w, h]: [f64; 4]) -> egui::Rect {
+        egui::Rect::from_min_max(self.pos(x, y), self.pos(x + w, y + h))
+    }
+    fn mm(&self, p: Pos2) -> (f64, f64) {
+        ((p.x - self.origin.x) as f64 / self.z, (p.y - self.origin.y) as f64 / self.z)
+    }
+}
+
+fn snap(v: f64, step: f64) -> f64 {
+    ((v / step).round() * step * 1e6).round() / 1e6
+}
+
+/// Box of a resize in progress.
+fn resized([x, y, w, h]: [f64; 4], (cx, cy): (f64, f64), (sx, sy): (f64, f64)) -> [f64; 4] {
+    let (ax, ay) = (x + (1.0 - cx) * w, y + (1.0 - cy) * h);
+    let (nw, nh) = (w * sx, h * sy);
+    [if cx > 0.5 { ax } else { ax - nw }, if cy > 0.5 { ay } else { ay - nh }, nw, nh]
+}
+
+/// Raster preview colour: darker with more power.
+fn burn_tint(power: u16, faded: bool) -> Color32 {
+    let a = 40.0 + 215.0 * power.min(1000) as f32 / 1000.0;
+    Color32::from_rgba_unmultiplied(46, 30, 18, if faded { a * 0.2 } else { a } as u8)
+}
+
+// --------------------------------------------------------------------- app
 
 struct App {
     job: Job,
     job_path: Option<PathBuf>,
-    saved_job: Job,
+    saved: Job,
     selected: Option<usize>,
     cache: GeometryCache,
-    compiled_job: Option<Job>,
-    views: Vec<OpView>,
+    compiled: Option<Job>,
+    views: Vec<ItemView>,
     plan: Arc<Plan>,
     plan_fp: u64,
-    plan_errors: Vec<String>,
+    first_error: Option<String>,
+    timing: Timing,
+    estimate: Option<Estimate>,
     last_change: Instant,
     textures: HashMap<u64, egui::TextureHandle>,
+    fixes: Vec<Fix>,
+    laser: Laser,
+    lock_ratio: bool,
+    act: Vec<Action>,
+    undo: Vec<Job>,
+    redo: Vec<Job>,
+    committed: Job,
+    last_dir: Option<PathBuf>,
 
     cfg: Config,
     ports: Vec<PortInfo>,
-    port_choice: Option<PortChoice>,
+    ports_at: Option<Instant>,
+    port_seen: bool,
+    choice: Option<PortChoice>,
     tx: Option<Sender<Cmd>>,
     rx: Receiver<Event>,
     worker: Option<JoinHandle<()>>,
     connected: Option<(Model, String)>,
-    busy: bool,
+    pending: usize,
     head: Option<(u32, u32)>,
     framing: Option<Rect>,
-    pending_frame: Option<(Rect, Option<u64>)>,
-    framed_fp: Option<u64>,
+    frame_req: Option<(Rect, Option<u64>)>,
     frame_scope: FrameScope,
-    live_reframe: bool,
+    framed_fp: Option<u64>,
     running: bool,
     control: Arc<Control>,
     progress: Option<Progress>,
-    last_result: Option<Result<(), String>>,
-    confirm_open: bool,
-    confirm_checked: bool,
-    jog_step_mm: f64,
+    confirm: bool,
+    discard: Option<Pending>,
+    jog_mm: f64,
 
+    status: Option<(String, bool)>,
     log: Vec<String>,
-    view: View,
-    drag: Option<Drag>,
-    pan_drag: bool,
+    show_log: bool,
+    gesture: Option<Gesture>,
     title: String,
     screenshot: Option<(PathBuf, u32)>,
 }
@@ -264,49 +408,58 @@ impl App {
             log.push(format!("config ignored: {e:#}"));
             Config::default()
         });
+        let job = Job { base_dir: std::env::current_dir().unwrap_or_default(), ..Default::default() };
         let mut app = App {
-            job: Job::default(),
+            saved: job.clone(),
+            committed: job.clone(),
+            job,
             job_path: None,
-            saved_job: Job::default(),
             selected: None,
             cache: GeometryCache::default(),
-            compiled_job: None,
+            compiled: None,
             views: Vec::new(),
             plan: Arc::new(Plan::default()),
             plan_fp: 0,
-            plan_errors: Vec::new(),
+            first_error: None,
+            timing: timing::load(),
+            estimate: None,
             last_change: Instant::now(),
             textures: HashMap::new(),
-            port_choice: cfg.port.clone().map(PortChoice::Serial),
+            fixes: Vec::new(),
+            laser: Laser { power: 50.0, min_power: 0.0, depth: 10, passes: 1 },
+            lock_ratio: true,
+            act: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_dir: None,
             cfg,
-            ports: transport::list_ports(),
+            ports: Vec::new(),
+            ports_at: None,
+            port_seen: false,
+            choice: None,
             tx: Some(tx),
             rx,
             worker: Some(worker),
             connected: None,
-            busy: false,
+            pending: 0,
             head: None,
             framing: None,
-            pending_frame: None,
-            framed_fp: None,
+            frame_req: None,
             frame_scope: FrameScope::Job,
-            live_reframe: true,
+            framed_fp: None,
             running: false,
             control: Control::new(),
             progress: None,
-            last_result: None,
-            confirm_open: false,
-            confirm_checked: false,
-            jog_step_mm: 1.0,
+            confirm: false,
+            discard: None,
+            jog_mm: 1.0,
+            status: None,
             log,
-            view: View { zoom: 8.0, pan: Vec2::splat(40.0), fitted: false },
-            drag: None,
-            pan_drag: false,
+            show_log: false,
+            gesture: None,
             title: String::new(),
             screenshot: std::env::var_os("K4LASER_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
         };
-        // never auto-pick: CH340 adapters are indistinguishable, and the wrong one may
-        // drive something else; the user chooses once, the choice is saved on connect
         if let Some(p) = job_path {
             app.open(&p);
         }
@@ -317,9 +470,9 @@ impl App {
         self.connected.as_ref().and_then(|(m, _)| m.area_px()).unwrap_or(P::K4_AREA_PX)
     }
 
-    fn area_mm(&self) -> (f32, f32) {
+    fn area_mm(&self) -> (f64, f64) {
         let (w, h) = self.area_px();
-        ((w as f64 * P::PITCH_MM) as f32, (h as f64 * P::PITCH_MM) as f32)
+        (w as f64 * P::PITCH_MM, h as f64 * P::PITCH_MM)
     }
 
     fn logln(&mut self, s: impl Into<String>) {
@@ -329,168 +482,501 @@ impl App {
         }
     }
 
+    fn info(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        self.logln(s.clone());
+        self.status = Some((s, false));
+    }
+
+    fn fail(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        self.logln(format!("error: {s}"));
+        self.status = Some((s, true));
+    }
+
     fn send(&mut self, cmd: Cmd) {
         if let Some(tx) = &self.tx {
-            self.busy = true;
+            self.pending += 1;
             let _ = tx.send(cmd);
         }
+    }
+
+    fn dirty(&self) -> bool {
+        self.job.ops != self.saved.ops || self.job.variables != self.saved.variables
+    }
+
+    fn dialog(&self) -> rfd::FileDialog {
+        let d = rfd::FileDialog::new();
+        match &self.last_dir {
+            Some(dir) => d.set_directory(dir),
+            None => d,
+        }
+    }
+
+    fn remember_dir(&mut self, p: &Path) {
+        self.last_dir = p.parent().map(Path::to_path_buf);
     }
 
     // ------------------------------------------------------------- files
 
     fn open(&mut self, path: &Path) {
-        match Job::load(path, &Default::default()) {
+        match Job::load(path, &BTreeMap::new()) {
             Ok(job) => {
-                self.saved_job = job.clone();
+                self.saved = job.clone();
+                self.committed = job.clone();
                 self.job = job;
+                self.undo.clear();
+                self.redo.clear();
                 self.job_path = Some(path.to_path_buf());
                 self.selected = None;
-                self.view.fitted = false;
-                self.logln(format!("opened {}", path.display()));
+                self.frame_scope = FrameScope::Job;
+                self.remember_dir(path);
+                self.info(format!("Opened {}", path.display()));
             }
-            Err(e) => self.logln(format!("error: {e:#}")),
+            Err(e) => self.fail(format!("{e:#}")),
         }
     }
 
+    fn new_job(&mut self) {
+        let job = Job { base_dir: self.job.base_dir.clone(), ..Default::default() };
+        self.saved = job.clone();
+        self.committed = job.clone();
+        self.job = job;
+        self.undo.clear();
+        self.redo.clear();
+        self.job_path = None;
+        self.selected = None;
+        self.frame_scope = FrameScope::Job;
+    }
+
+    fn request(&mut self, p: Pending) {
+        if self.dirty() {
+            self.discard = Some(p);
+        } else {
+            self.proceed(p);
+        }
+    }
+
+    fn proceed(&mut self, p: Pending) {
+        match p {
+            Pending::New => self.new_job(),
+            Pending::Open(path) => self.open(&path),
+        }
+    }
+
+    /// Save to `path`, or to the current file, or ask.
     fn save(&mut self, path: Option<PathBuf>) {
         let path = match path.or_else(|| self.job_path.clone()) {
             Some(p) => p,
             None => {
-                match rfd::FileDialog::new().add_filter("k4laser job", &["toml"]).set_file_name("job.toml").save_file()
-                {
+                match self.dialog().add_filter("k4laser project", &["toml"]).set_file_name("job.toml").save_file() {
                     Some(p) => p,
                     None => return,
                 }
             }
         };
-        // relative source paths stay valid only next to the same base directory
-        if let Some(dir) = path.parent() {
-            let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-            if self.job.base_dir.as_os_str().is_empty() {
-                self.job.base_dir = dir;
-            } else if dir != self.job.base_dir {
-                self.logln("note: saved to another directory; relative source paths now resolve from there");
-                self.job.base_dir = dir;
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // files next to the project are stored relative to it, others absolute
+        let old_base = self.job.base_dir.clone();
+        for op in &mut self.job.ops {
+            let p = match &mut op.source {
+                Source::Image(s) => &mut s.path,
+                Source::Svg(s) => &mut s.path,
+                Source::Dxf(s) => &mut s.path,
+                _ => continue,
+            };
+            if p.is_empty() || p.contains("${") {
+                continue;
             }
+            let abs = sources::resolve(p, &old_base);
+            *p = match abs.strip_prefix(&dir) {
+                Ok(rel) => rel.display().to_string(),
+                Err(_) => abs.display().to_string(),
+            };
         }
+        self.job.base_dir = dir;
         match self.job.save(&path) {
             Ok(()) => {
-                self.saved_job = self.job.clone();
+                self.saved = self.job.clone();
+                self.committed = self.job.clone();
                 self.job_path = Some(path.clone());
-                self.logln(format!("saved {}", path.display()));
+                self.remember_dir(&path);
+                self.info(format!("Saved {}", path.display()));
             }
-            Err(e) => self.logln(format!("error: {e:#}")),
+            Err(e) => self.fail(format!("{}: {e:#}", path.display())),
         }
     }
 
-    fn pick_file(&self, name: &str, exts: &[&str]) -> Option<String> {
-        let mut d = rfd::FileDialog::new().add_filter(name, exts);
-        if !self.job.base_dir.as_os_str().is_empty() {
-            d = d.set_directory(&self.job.base_dir);
+    fn add_files_dialog(&mut self) {
+        let all: Vec<&str> = IMAGE_EXTS.iter().chain(SVG_EXTS).chain(DXF_EXTS).copied().collect();
+        let Some(paths) = self
+            .dialog()
+            .add_filter("Images, SVG, DXF", &all)
+            .add_filter("Images", IMAGE_EXTS)
+            .add_filter("SVG", SVG_EXTS)
+            .add_filter("DXF", DXF_EXTS)
+            .pick_files()
+        else {
+            return;
+        };
+        for p in paths {
+            self.add_path(&p);
         }
-        let p = d.pick_file()?;
-        // store relative to the job directory when possible: jobs stay portable
-        Some(match p.strip_prefix(&self.job.base_dir) {
-            Ok(rel) if !self.job.base_dir.as_os_str().is_empty() => rel.display().to_string(),
-            _ => p.display().to_string(),
-        })
+    }
+
+    fn add_path(&mut self, path: &Path) {
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        self.remember_dir(&abs);
+        let ext = abs.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let p = abs.display().to_string();
+        let src = if IMAGE_EXTS.contains(&ext.as_str()) {
+            let (w, h) = match sources::image_size(&abs) {
+                Ok(s) => s,
+                Err(e) => return self.fail(format!("{}: {e:#}", abs.display())),
+            };
+            // a first size that fits a 50 mm box; the user resizes from there
+            let f = 50.0 / w.max(h).max(1) as f64;
+            let r = |v: f64| (v * 100.0).round() / 100.0;
+            Source::Image(ImageSrc {
+                path: p,
+                width_mm: r(w as f64 * f),
+                height_mm: r(h as f64 * f),
+                ..Default::default()
+            })
+        } else if SVG_EXTS.contains(&ext.as_str()) {
+            Source::Svg(SvgSrc { path: p, ..Default::default() })
+        } else if DXF_EXTS.contains(&ext.as_str()) {
+            Source::Dxf(DxfSrc { path: p, ..Default::default() })
+        } else if ext == "toml" {
+            return self.request(Pending::Open(abs));
+        } else {
+            return self.fail(format!("{}: not an image, SVG or DXF file", abs.display()));
+        };
+        self.add_op(Operation::new(src));
+    }
+
+    /// Append with the last laser settings, centred and shrunk into the bed.
+    fn add_op(&mut self, mut op: Operation) {
+        op.power = self.laser.power;
+        op.depth = self.laser.depth;
+        op.passes = self.laser.passes;
+        if op.is_grayscale() {
+            op.min_power = self.laser.min_power.min(op.power);
+        }
+        self.job.ops.push(op);
+        let i = self.job.ops.len() - 1;
+        self.selected = Some(i);
+        let (aw, ah) = self.area_mm();
+        self.fixes.push(Fix { op: i, at: (aw / 2.0, ah / 2.0), frac: (0.5, 0.5), fit: true });
+    }
+
+    fn replace_file(&mut self, i: usize) {
+        let (name, exts) = match self.job.ops.get(i).map(|op| &op.source) {
+            Some(Source::Image(_)) => ("Images", IMAGE_EXTS),
+            Some(Source::Svg(_)) => ("SVG", SVG_EXTS),
+            Some(Source::Dxf(_)) => ("DXF", DXF_EXTS),
+            _ => return,
+        };
+        let Some(p) = self.dialog().add_filter(name, exts).pick_file() else { return };
+        let abs = std::path::absolute(&p).unwrap_or(p);
+        self.remember_dir(&abs);
+        let size = sources::image_size(&abs).ok();
+        match &mut self.job.ops[i].source {
+            Source::Image(s) => {
+                s.path = abs.display().to_string();
+                // keep the width, follow the new aspect ratio
+                if let Some((w, h)) = size.filter(|&(w, h)| w > 0 && h > 0) {
+                    let r = |v: f64| (v * 100.0).round() / 100.0;
+                    if s.width_mm > 0.0 {
+                        s.height_mm = r(s.width_mm * h as f64 / w as f64);
+                    } else if s.height_mm > 0.0 {
+                        s.width_mm = r(s.height_mm * w as f64 / h as f64);
+                    }
+                }
+            }
+            Source::Svg(s) => s.path = abs.display().to_string(),
+            Source::Dxf(d) => d.path = abs.display().to_string(),
+            _ => {}
+        }
     }
 
     // ----------------------------------------------------------- compile
 
-    fn recompile_if_needed(&mut self) {
-        if self.compiled_job.as_ref() == Some(&self.job) {
+    fn recompile(&mut self) {
+        if self.compiled.as_ref() == Some(&self.job) {
             return;
         }
-        if self.job.base_dir.as_os_str().is_empty() {
-            self.job.base_dir = std::env::current_dir().unwrap_or_default();
-        }
         let area = self.area_px();
+        let (aw, ah) = self.area_mm();
         let mut views = Vec::with_capacity(self.job.ops.len());
         let mut plan = Plan::default();
-        let mut errors = Vec::new();
+        let mut first_error = None;
         for op in &self.job.ops {
-            let mut v = OpView::default();
+            let mut v = ItemView::default();
             match self.cache.get(op, &self.job.base_dir, &self.job.variables) {
                 Err(e) => v.error = Some(format!("{e:#}")),
                 Ok(prep) => {
                     v.notes = prep.notes.clone();
+                    v.frame = prep.frame.map(|[x, y, w, h]| [op.x_mm + x, op.y_mm + y, w, h]);
                     match job::compile_op(op, &prep) {
                         Err(e) => v.error = Some(format!("{e:#}")),
-                        Ok(None) => v.notes.push("nothing to burn".into()),
-                        Ok(Some(p)) => {
-                            if let Err(e) = job::check_area(&p, area) {
-                                v.error = Some(e.to_string());
+                        Ok(plans) => {
+                            if plans.is_empty() {
+                                v.notes.push("nothing to burn".into());
                             }
-                            v.plan = Some(p);
+                            if plans.iter().any(|p| job::check_area(p, area).is_err()) {
+                                v.error = Some(format!("extends past the {aw:.0} × {ah:.0} mm bed"));
+                            }
+                            v.plans = plans;
                         }
                     }
                 }
             }
             if op.enabled {
-                match (&v.error, &v.plan) {
-                    (Some(e), _) => errors.push(format!("{}: {e}", op.label())),
-                    (None, Some(p)) => plan.ops.push(p.clone()),
-                    _ => {}
+                match &v.error {
+                    Some(e) => {
+                        let label = op.label();
+                        first_error.get_or_insert_with(|| {
+                            if e.starts_with(&label) { e.clone() } else { format!("{label}: {e}") }
+                        });
+                    }
+                    None => plan.ops.extend(v.plans.iter().cloned()),
                 }
             }
             views.push(v);
         }
         self.plan_fp = plan.fingerprint();
         self.plan = Arc::new(plan);
-        self.plan_errors = errors;
+        self.first_error = first_error;
         self.views = views;
-        self.compiled_job = Some(self.job.clone());
+        self.compiled = Some(self.job.clone());
         self.last_change = Instant::now();
+        self.refresh_estimates();
     }
 
-    fn frame_target(&self) -> Option<(Rect, Option<u64>)> {
-        match self.frame_scope {
-            FrameScope::Job => {
-                self.plan.bbox().filter(|_| self.plan_errors.is_empty()).map(|r| (r, Some(self.plan_fp)))
+    /// Durations from the timing model learned on the machine.
+    fn refresh_estimates(&mut self) {
+        for v in &mut self.views {
+            v.duration = (!v.plans.is_empty()).then(|| self.timing.estimate_ops(&v.plans));
+        }
+        self.estimate = (!self.plan.ops.is_empty()).then(|| self.timing.estimate(&self.plan));
+    }
+
+    /// Recompile, then apply pending placements (they need the compiled size).
+    fn settle(&mut self) {
+        self.recompile();
+        for fix in std::mem::take(&mut self.fixes) {
+            if fix.op >= self.job.ops.len() {
+                continue;
             }
-            FrameScope::Selection => {
-                let v = self.views.get(self.selected?)?;
-                v.plan.as_ref().filter(|_| v.error.is_none()).map(|p| (p.bbox(), None))
+            if fix.fit
+                && let Some([_, _, w, h]) = self.views[fix.op].frame
+            {
+                let (aw, ah) = self.area_mm();
+                let f = (aw * 0.9 / w).min(ah * 0.9 / h);
+                if f < 1.0 && self.scale_op(fix.op, f, f, (w, h)) {
+                    self.recompile();
+                }
+            }
+            if let Some([x, y, w, h]) = self.views[fix.op].frame {
+                let op = &mut self.job.ops[fix.op];
+                op.x_mm = snap(op.x_mm + fix.at.0 - (x + fix.frac.0 * w), P::PITCH_MM);
+                op.y_mm = snap(op.y_mm + fix.at.1 - (y + fix.frac.1 * h), P::PITCH_MM);
+                self.recompile();
             }
         }
     }
 
-    fn start_frame(&mut self) {
-        if let Some((rect, fp)) = self.frame_target() {
-            self.pending_frame = Some((rect, fp));
+    /// Scale item `i` by (fx, fy) on the bed, given its current box size.
+    fn scale_op(&mut self, i: usize, fx: f64, fy: f64, (w, h): (f64, f64)) -> bool {
+        let base = self.job.base_dir.clone();
+        let op = &mut self.job.ops[i];
+        // the source has its own axes; a quarter turn swaps them
+        let turned = op.rotate % 180 == 90;
+        let (sfx, sfy, size) = if turned { (fy, fx, (h, w)) } else { (fx, fy, (w, h)) };
+        match op.source.scale(sfx, sfy, size, &base) {
+            Ok(()) => true,
+            Err(e) => {
+                self.fail(format!("resize: {e:#}"));
+                false
+            }
+        }
+    }
+
+    fn resize(&mut self, i: usize, fx: f64, fy: f64, frac: (f64, f64)) {
+        let Some([x, y, w, h]) = self.views.get(i).and_then(|v| v.frame) else { return };
+        if !(fx.is_finite() && fy.is_finite() && fx > 0.0 && fy > 0.0) {
+            return;
+        }
+        if self.scale_op(i, fx, fy, (w, h)) {
+            self.fixes.push(Fix { op: i, at: (x + frac.0 * w, y + frac.1 * h), frac, fit: false });
+        }
+    }
+
+    // ------------------------------------------------------------ history
+
+    fn undo_tick(&mut self, ctx: &egui::Context) {
+        if self.job == self.committed {
+            return;
+        }
+        let settled = self.gesture.is_none()
+            && self.last_change.elapsed() > Duration::from_millis(500)
+            && !ctx.input(|i| i.pointer.any_down());
+        if settled {
+            self.undo.push(std::mem::replace(&mut self.committed, self.job.clone()));
+            if self.undo.len() > 200 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(550));
+        }
+    }
+
+    fn undo(&mut self) {
+        if self.job != self.committed {
+            self.undo.push(std::mem::replace(&mut self.committed, self.job.clone()));
+        }
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.committed, prev));
+            self.job = self.committed.clone();
+            self.after_history();
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.job != self.committed {
+            return;
+        }
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.committed, next));
+            self.job = self.committed.clone();
+            self.after_history();
+        }
+    }
+
+    fn after_history(&mut self) {
+        self.selected = self.selected.filter(|&i| i < self.job.ops.len());
+        self.frame_scope = FrameScope::Job;
+        self.gesture = None;
+    }
+
+    // ------------------------------------------------------------ machine
+
+    fn frame_target(&self, scope: FrameScope) -> Option<(Rect, Option<u64>)> {
+        match scope {
+            FrameScope::Job => {
+                if self.first_error.is_some() {
+                    return None;
+                }
+                self.plan.bbox().map(|r| (r, Some(self.plan_fp)))
+            }
+            FrameScope::Item(i) => {
+                let v = self.views.get(i).filter(|v| v.error.is_none())?;
+                Plan { ops: v.plans.clone() }.bbox().map(|r| (r, None))
+            }
+        }
+    }
+
+    fn start_frame(&mut self, scope: FrameScope) {
+        if let Some((rect, fp)) = self.frame_target(scope) {
+            self.frame_scope = scope;
+            self.frame_req = Some((rect, fp));
             self.send(Cmd::Frame(rect));
         }
+    }
+
+    fn framing_active(&self) -> bool {
+        self.framing.is_some() || self.frame_req.is_some()
     }
 
     fn stop(&mut self) {
         if self.running {
             self.control.cancel.store(true, Ordering::SeqCst);
             self.logln("STOP requested");
-        }
-        if self.framing.is_some() || self.pending_frame.is_some() {
-            self.pending_frame = None;
+        } else if self.framing_active() {
+            self.frame_req = None;
             self.send(Cmd::FrameStop);
+        } else if self.connected.is_some() {
+            self.send(Cmd::Stop);
         }
     }
 
-    fn can_burn(&self) -> bool {
-        self.connected.is_some()
-            && !self.running
-            && !self.plan.ops.is_empty()
-            && self.plan_errors.is_empty()
-            && self.framed_fp == Some(self.plan_fp)
+    /// Ok, or why Start is not available.
+    fn can_start(&self) -> Result<(), String> {
+        if self.running {
+            Err("Engraving…".into())
+        } else if self.connected.is_none() {
+            Err("Connect the engraver (top right)".into())
+        } else if self.job.ops.is_empty() {
+            Err("Add something to engrave".into())
+        } else if let Some(e) = &self.first_error {
+            Err(e.clone())
+        } else if self.plan.ops.is_empty() {
+            Err("Nothing to burn: every item is disabled or empty".into())
+        } else if self.pending > 0 {
+            Err("Machine busy…".into())
+        } else {
+            Ok(())
+        }
     }
 
-    // ------------------------------------------------------------ events
+    fn start_job(&mut self) {
+        if self.can_start().is_err() {
+            return;
+        }
+        self.confirm = false;
+        self.control = Control::new();
+        self.running = true;
+        self.progress = None;
+        self.status = None;
+        self.frame_req = None;
+        self.gesture = None;
+        let plan = self.plan.clone();
+        self.logln(format!("job started: {} part(s)", plan.ops.len()));
+        // the machine switches framing off before burning
+        self.send(Cmd::Run(plan, self.control.clone()));
+    }
+
+    fn connect(&mut self, choice: PortChoice) {
+        self.logln(format!("connecting to {}…", choice.label()));
+        self.choice = Some(choice.clone());
+        self.send(Cmd::Connect(choice, self.cfg.settings));
+    }
+
+    /// Rescan ports while disconnected; connect when the remembered port appears.
+    fn poll_ports(&mut self) {
+        if self.connected.is_some() || self.ports_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.ports_at = Some(Instant::now());
+        self.ports = transport::list_ports();
+        self.ports.sort_by_key(|p| !p.is_ch340());
+        let present =
+            self.cfg.port.as_ref().is_some_and(|want| {
+                self.ports.iter().any(|p| p.stable_path() == want.as_path() && p.holders.is_empty())
+            });
+        // only the port the user picked before, only on (re)appearance, never in self-tests
+        if present && !self.port_seen && self.pending == 0 && self.screenshot.is_none() {
+            let port = self.cfg.port.clone().unwrap();
+            self.connect(PortChoice::Serial(port));
+        }
+        self.port_seen = present;
+    }
 
     fn drain_events(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                Event::Log(s) => self.logln(s),
+                Event::Log(s) => {
+                    if let Some(e) = s.strip_prefix("error: ") {
+                        self.status = Some((e.to_string(), true));
+                    }
+                    self.logln(s);
+                }
                 Event::Connected { model, port } => {
                     self.logln(format!("connected to {port}: {}", model.describe()));
-                    if let Some(PortChoice::Serial(p)) = &self.port_choice
+                    if let Some(PortChoice::Serial(p)) = &self.choice
                         && self.cfg.port.as_ref() != Some(p)
                     {
                         self.cfg.port = Some(p.clone());
@@ -499,39 +985,166 @@ impl App {
                         }
                     }
                     self.connected = Some((model, port));
-                    self.compiled_job = None; // the work area may differ
+                    self.status = Some(("Engraver connected".into(), false));
+                    self.compiled = None; // the work area may differ
                 }
                 Event::Disconnected => {
                     self.connected = None;
                     self.head = None;
                     self.framing = None;
-                    self.pending_frame = None;
+                    self.frame_req = None;
                     self.running = false;
+                    self.ports_at = None;
                     self.logln("disconnected");
                 }
                 Event::State { head, framing } => {
                     self.head = head;
                     self.framing = framing;
-                    if let (Some(f), Some((r, fp))) = (framing, self.pending_frame)
+                    if let (Some(f), Some((r, fp))) = (framing, self.frame_req)
                         && f == r
                     {
-                        self.pending_frame = None;
+                        self.frame_req = None;
                         if fp.is_some() {
                             self.framed_fp = fp;
                         }
                     }
                 }
-                Event::Idle => self.busy = false,
+                Event::Idle => {
+                    self.pending = self.pending.saturating_sub(1);
+                    if self.pending == 0 {
+                        self.frame_req = None; // a failed frame request
+                    }
+                }
                 Event::Progress(p) => self.progress = Some(p),
                 Event::JobDone(res) => {
                     self.running = false;
-                    match &res {
-                        Ok(()) => self.logln("job finished"),
-                        Err(e) => self.logln(format!("job ended: {e}")),
+                    let took = self.progress.as_ref().map(|p| fmt_dur(p.elapsed)).unwrap_or_default();
+                    match res {
+                        Ok(()) => self.info(format!("Job finished in {took}")),
+                        Err(e) => self.fail(format!("Job {e}")),
                     }
-                    self.last_result = Some(res);
+                }
+                Event::Timing(t) => {
+                    self.timing = *t;
+                    self.refresh_estimates();
                 }
             }
+        }
+    }
+
+    /// Follow edits with the framing beam.
+    fn live_reframe(&mut self) {
+        if self.running || self.pending > 0 || self.gesture.is_some() {
+            return;
+        }
+        let Some(current) = self.framing else { return };
+        match self.frame_target(self.frame_scope) {
+            Some((rect, _)) if rect != current && self.last_change.elapsed() > Duration::from_millis(250) => {
+                self.start_frame(self.frame_scope);
+            }
+            Some((rect, _)) if rect != current => {}
+            Some((_, Some(fp))) => self.framed_fp = Some(fp),
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------ actions
+
+    fn apply_actions(&mut self) {
+        for a in std::mem::take(&mut self.act) {
+            let editing = !self.running;
+            match a {
+                Action::AddFiles if editing => self.add_files_dialog(),
+                Action::AddSource(src) if editing => self.add_op(Operation::new(src)),
+                Action::AddTestGrid if editing => {
+                    let ops = job::calibration_grid(&[20.0, 40.0, 60.0, 80.0, 100.0], &[5, 10, 20, 40, 80], 4.0, 1.5);
+                    self.job.ops.extend(ops);
+                    self.selected = None;
+                    self.info(
+                        "Test grid added: burn it on scrap, then pick the power and burn time of the best square",
+                    );
+                }
+                Action::ReplaceFile(i) if editing => self.replace_file(i),
+                Action::New if editing => self.request(Pending::New),
+                Action::Open if editing => {
+                    if let Some(p) = self.dialog().add_filter("k4laser project", &["toml"]).pick_file() {
+                        self.request(Pending::Open(p));
+                    }
+                }
+                Action::Save => self.save(None),
+                Action::SaveAs => {
+                    let name =
+                        self.job_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                    let d = self.dialog().add_filter("k4laser project", &["toml"]);
+                    if let Some(p) = d.set_file_name(name.unwrap_or_else(|| "job.toml".into())).save_file() {
+                        self.save(Some(p));
+                    }
+                }
+                Action::Duplicate(i) if editing && i < self.job.ops.len() => {
+                    let mut op = self.job.ops[i].clone();
+                    op.x_mm = snap(op.x_mm + 2.0, P::PITCH_MM);
+                    op.y_mm = snap(op.y_mm + 2.0, P::PITCH_MM);
+                    self.job.ops.insert(i + 1, op);
+                    self.selected = Some(i + 1);
+                    self.frame_scope = FrameScope::Job;
+                }
+                Action::Delete(i) if editing && i < self.job.ops.len() => {
+                    self.job.ops.remove(i);
+                    let n = self.job.ops.len();
+                    self.selected = (n > 0).then(|| i.min(n - 1));
+                    self.frame_scope = FrameScope::Job;
+                }
+                Action::Reorder(i, up) if editing => {
+                    let j = if up { i.checked_sub(1) } else { Some(i + 1) };
+                    if let Some(j) = j.filter(|&j| j < self.job.ops.len() && i < self.job.ops.len()) {
+                        self.job.ops.swap(i, j);
+                        self.selected = Some(j);
+                        self.frame_scope = FrameScope::Job;
+                    }
+                }
+                Action::Undo if editing => self.undo(),
+                Action::Redo if editing => self.redo(),
+                Action::Connect(choice) => self.connect(choice),
+                Action::Rescan => {
+                    self.ports_at = None;
+                    self.poll_ports();
+                }
+                Action::Frame(scope) if editing => self.start_frame(scope),
+                Action::FrameStop => {
+                    self.frame_req = None;
+                    self.send(Cmd::FrameStop);
+                }
+                Action::Stop => self.stop(),
+                Action::Center(i) if editing => {
+                    let (aw, ah) = self.area_mm();
+                    self.fixes.push(Fix { op: i, at: (aw / 2.0, ah / 2.0), frac: (0.5, 0.5), fit: false });
+                }
+                Action::Rotate(i, deg) if editing && i < self.job.ops.len() => {
+                    let center = self.views.get(i).and_then(|v| v.frame).map(|[x, y, w, h]| (x + w / 2.0, y + h / 2.0));
+                    let op = &mut self.job.ops[i];
+                    op.rotate = (op.rotate + deg) % 360;
+                    if let Some(at) = center {
+                        self.fixes.push(Fix { op: i, at, frac: (0.5, 0.5), fit: false });
+                    }
+                }
+                Action::Mirror(i) if editing && i < self.job.ops.len() => {
+                    let op = &mut self.job.ops[i];
+                    op.mirror = !op.mirror;
+                }
+                Action::Resize(i, fx, fy, frac) if editing && i < self.job.ops.len() => self.resize(i, fx, fy, frac),
+                Action::Machine(cmd) => self.send(cmd),
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if self.running {
+            return;
+        }
+        for p in dropped {
+            self.add_path(&p);
         }
     }
 
@@ -539,442 +1152,616 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let idle = !self.running;
-            if ui.add_enabled(idle, egui::Button::new("New")).clicked() {
-                self.job = Job { base_dir: self.job.base_dir.clone(), ..Default::default() };
-                self.saved_job = self.job.clone();
-                self.job_path = None;
-                self.selected = None;
-            }
-            if ui.add_enabled(idle, egui::Button::new("Open…")).clicked()
-                && let Some(p) = rfd::FileDialog::new().add_filter("k4laser job", &["toml"]).pick_file()
-            {
-                self.open(&p);
-            }
-            if ui.button("Save").clicked() {
-                self.save(None);
-            }
-            if ui.button("Save as…").clicked()
-                && let Some(p) =
-                    rfd::FileDialog::new().add_filter("k4laser job", &["toml"]).set_file_name("job.toml").save_file()
-            {
-                self.save(Some(p));
-            }
-            if ui.button("Reload sources").on_hover_text("Re-read image/SVG/DXF files and fonts").clicked() {
-                self.cache = GeometryCache::default();
-                self.compiled_job = None;
-            }
-            ui.separator();
-
-            let connected = self.connected.is_some();
-            ui.add_enabled_ui(!connected && !self.busy, |ui| {
-                let text = self.port_choice.as_ref().map(PortChoice::label).unwrap_or_else(|| "select port…".into());
-                egui::ComboBox::from_id_salt("port").width(360.0).selected_text(text).show_ui(ui, |ui| {
-                    for p in &self.ports {
-                        let choice = PortChoice::Serial(p.stable_path().to_path_buf());
-                        let label = format!("{}\n    {}", p.stable_path().display(), p.label());
-                        let text = if p.holders.is_empty() {
-                            egui::RichText::new(label)
-                        } else {
-                            egui::RichText::new(label).color(Color32::from_rgb(220, 120, 40))
-                        };
-                        ui.selectable_value(&mut self.port_choice, Some(choice), text);
+            ui.add_enabled_ui(!self.running, |ui| {
+                let add = egui::Button::new(RichText::new("+  Add file…").strong()).min_size(Vec2::new(0.0, 28.0));
+                if ui.add(add).on_hover_text("Image, SVG or DXF  (Ctrl+O)").clicked() {
+                    self.act.push(Action::AddFiles);
+                }
+                ui.menu_button("Add ▾", |ui| {
+                    let shape = |shape, w, h| Source::Shape(ShapeSrc { shape, width_mm: w, height_mm: h });
+                    let items = [
+                        ("Text", Source::default_of("text")),
+                        ("QR code", Source::default_of("qr")),
+                        ("Rectangle", Some(shape(ShapeKind::Rect, 30.0, 20.0))),
+                        ("Circle", Some(shape(ShapeKind::Circle, 20.0, 20.0))),
+                        ("Cross", Some(shape(ShapeKind::Cross, 10.0, 10.0))),
+                        ("", None),
+                        ("Test grid (power × burn time)", None),
+                        ("Scale ruler", Source::default_of("ruler")),
+                    ];
+                    for (label, src) in items {
+                        if label.is_empty() {
+                            ui.separator();
+                        } else if ui.button(label).clicked() {
+                            self.act.push(src.map(Action::AddSource).unwrap_or(Action::AddTestGrid));
+                            ui.close();
+                        }
                     }
-                    ui.selectable_value(
-                        &mut self.port_choice,
-                        Some(PortChoice::Simulator),
-                        PortChoice::Simulator.label(),
-                    );
                 });
-                if ui.button("Rescan").on_hover_text("Rescan serial ports").clicked() {
-                    self.ports = transport::list_ports();
+                ui.separator();
+                if ui.button("New").clicked() {
+                    self.act.push(Action::New);
+                }
+                if ui.button("Open…").on_hover_text("Open a project (.toml)").clicked() {
+                    self.act.push(Action::Open);
                 }
             });
-            if connected {
-                if ui.add_enabled(!self.running, egui::Button::new("Disconnect")).clicked() {
-                    self.send(Cmd::Disconnect);
-                }
-            } else if ui.add_enabled(self.port_choice.is_some() && !self.busy, egui::Button::new("Connect")).clicked() {
-                let choice = self.port_choice.clone().unwrap();
-                self.logln(format!("connecting to {} (handshake, settings, home)…", choice.label()));
-                self.send(Cmd::Connect(choice, self.cfg.settings));
+            if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+                self.act.push(Action::Save);
             }
-            match &self.connected {
-                Some((m, _)) => ui.label(
-                    egui::RichText::new(format!("connected: {}", m.describe())).color(Color32::from_rgb(60, 170, 90)),
-                ),
-                None => ui.label(egui::RichText::new("not connected").weak()),
-            };
-            if self.busy {
-                ui.spinner();
+            if ui.button("Save as…").on_hover_text("Ctrl+Shift+S").clicked() {
+                self.act.push(Action::SaveAs);
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.machine_widget(ui));
         });
     }
 
-    fn ops_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Operations");
-            ui.menu_button("+ Add", |ui| {
-                for kind in Source::KINDS {
-                    if ui.button(kind).clicked() {
-                        let mut op = Operation::new(Source::default_of(kind).unwrap());
-                        op.x_mm = 5.0;
-                        op.y_mm = 5.0;
-                        self.job.ops.push(op);
-                        self.selected = Some(self.job.ops.len() - 1);
+    /// Right-to-left: the rightmost widget comes first.
+    fn machine_widget(&mut self, ui: &mut egui::Ui) {
+        let (aw, ah) = self.area_mm();
+        let idle = !self.running && self.pending == 0;
+        match &self.connected {
+            Some((model, port)) => {
+                let (model, port) = (model.describe(), port.clone());
+                let text =
+                    RichText::new(format!("●  Engraver connected · {aw:.0} × {ah:.0} mm ▾")).color(GREEN).strong();
+                ui.menu_button(text, |ui| {
+                    ui.label(RichText::new(model).weak());
+                    ui.label(RichText::new(port).weak().small());
+                    ui.separator();
+                    if ui.add_enabled(idle, egui::Button::new("Home the head")).clicked() {
+                        self.act.push(Action::Machine(Cmd::Home));
                         ui.close();
                     }
-                }
-            });
+                    ui.menu_button("Fan / aux output (experimental)", |ui| {
+                        ui.label(
+                            RichText::new("Hidden vendor commands 0xFD / 0xFE.\nTheir effect is not confirmed.").weak(),
+                        );
+                        if ui.add_enabled(idle, egui::Button::new("On  (0xFD)")).clicked() {
+                            self.act.push(Action::Machine(Cmd::Aux(true)));
+                        }
+                        if ui.add_enabled(idle, egui::Button::new("Off  (0xFE)")).clicked() {
+                            self.act.push(Action::Machine(Cmd::Aux(false)));
+                        }
+                    });
+                    ui.separator();
+                    if ui.add_enabled(!self.running, egui::Button::new("Disconnect")).clicked() {
+                        self.act.push(Action::Machine(Cmd::Disconnect));
+                        ui.close();
+                    }
+                });
+            }
+            None => {
+                ui.add_enabled_ui(idle, |ui| {
+                    ui.menu_button(RichText::new("Connect ▾").strong(), |ui| {
+                        ui.label(RichText::new("The engraver's USB serial port:").weak());
+                        for p in &self.ports {
+                            let path = p.stable_path().to_path_buf();
+                            let mut text = p.label();
+                            if p.is_ch340() {
+                                text = format!("CH340  {text}");
+                            }
+                            if self.cfg.port.as_ref() == Some(&path) {
+                                text.push_str("  ★ last used");
+                            }
+                            let r = ui
+                                .add_enabled(p.holders.is_empty(), egui::Button::new(text))
+                                .on_hover_text(path.display().to_string());
+                            if r.clicked() {
+                                self.act.push(Action::Connect(PortChoice::Serial(path)));
+                                ui.close();
+                            }
+                        }
+                        if self.ports.is_empty() {
+                            ui.label("No serial port found: plug the engraver in.");
+                        }
+                        ui.separator();
+                        if ui.button("Simulator (no hardware)").clicked() {
+                            self.act.push(Action::Connect(PortChoice::Simulator));
+                            ui.close();
+                        }
+                        if ui.button("Rescan").clicked() {
+                            self.act.push(Action::Rescan);
+                        }
+                    });
+                });
+                ui.label(RichText::new("○  Engraver not connected").color(ORANGE));
+            }
+        }
+        if self.pending > 0 && !self.running {
+            ui.spinner();
+        }
+    }
+
+    fn items_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Items");
+            if !self.job.ops.is_empty() {
+                ui.label(RichText::new(self.job.ops.len().to_string()).weak());
+            }
         });
-        ui.separator();
-        let mut action: Option<(usize, &str)> = None;
-        egui::ScrollArea::vertical().id_salt("ops").max_height(ui.available_height() * 0.6).show(ui, |ui| {
+        if self.job.ops.is_empty() {
+            ui.label(RichText::new("Nothing yet. Add a file, or text, a QR code or a shape from the top bar.").weak());
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt("items").max_height(210.0).auto_shrink([false, true]).show(ui, |ui| {
             for i in 0..self.job.ops.len() {
                 let err = self.views.get(i).is_some_and(|v| v.error.is_some());
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.job.ops[i].enabled, "");
+                    ui.checkbox(&mut self.job.ops[i].enabled, "").on_hover_text("Include in the job");
                     let op = &self.job.ops[i];
-                    let mut text = egui::RichText::new(format!("{}. {} [{}]", i + 1, op.label(), op.mode.as_str()));
+                    let power = if op.is_grayscale() {
+                        format!("{:.0}–{:.0} %", op.min_power, op.power)
+                    } else {
+                        format!("{:.0} %", op.power)
+                    };
+                    let passes = if op.passes > 1 { format!(" ×{}", op.passes) } else { String::new() };
+                    let summary = format!("{} · {power} · {}{passes}", op.mode.label(), op.depth);
+                    let mut text = RichText::new(if err { format!("⚠ {}", op.label()) } else { op.label() });
                     if err {
-                        text = text.color(Color32::from_rgb(220, 60, 60));
+                        text = text.color(ERROR);
                     } else if !op.enabled {
                         text = text.weak();
                     }
                     if ui.selectable_label(self.selected == Some(i), text).clicked() {
                         self.selected = Some(i);
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(summary).weak().small());
+                    });
                 });
             }
         });
         ui.horizontal(|ui| {
             let sel = self.selected.filter(|&i| i < self.job.ops.len());
             ui.add_enabled_ui(sel.is_some(), |ui| {
-                if ui.button("▲").on_hover_text("Move up").clicked() {
-                    action = sel.map(|i| (i, "up"));
+                let i = sel.unwrap_or(0);
+                if ui.button("Duplicate").on_hover_text("Ctrl+D").clicked() {
+                    self.act.push(Action::Duplicate(i));
                 }
-                if ui.button("▼").on_hover_text("Move down").clicked() {
-                    action = sel.map(|i| (i, "down"));
+                if ui.button("Delete").on_hover_text("Del").clicked() {
+                    self.act.push(Action::Delete(i));
                 }
-                if ui.button("Duplicate").clicked() {
-                    action = sel.map(|i| (i, "dup"));
+                if ui.button("▲").on_hover_text("Earlier in the job").clicked() {
+                    self.act.push(Action::Reorder(i, true));
                 }
-                if ui.button("Delete").clicked() {
-                    action = sel.map(|i| (i, "del"));
+                if ui.button("▼").on_hover_text("Later in the job").clicked() {
+                    self.act.push(Action::Reorder(i, false));
                 }
             });
         });
-        if let Some((i, a)) = action {
-            let n = self.job.ops.len();
-            match a {
-                "up" if i > 0 => {
-                    self.job.ops.swap(i, i - 1);
-                    self.selected = Some(i - 1);
-                }
-                "down" if i + 1 < n => {
-                    self.job.ops.swap(i, i + 1);
-                    self.selected = Some(i + 1);
-                }
-                "dup" => {
-                    let mut op = self.job.ops[i].clone();
-                    op.x_mm += 2.0;
-                    op.y_mm += 2.0;
-                    self.job.ops.insert(i + 1, op);
-                    self.selected = Some(i + 1);
-                }
-                "del" => {
-                    self.job.ops.remove(i);
-                    self.selected = if self.job.ops.is_empty() { None } else { Some(i.min(self.job.ops.len() - 1)) };
-                }
-                _ => {}
-            }
-        }
-
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new("Variables  ${name}").default_open(!self.job.variables.is_empty()).show(ui, |ui| {
-            let mut remove = None;
-            let mut rename: Option<(String, String)> = None;
-            // plain rows: a Grid cell never grows past its first-frame width
-            for (k, v) in self.job.variables.iter_mut() {
-                ui.horizontal(|ui| {
-                    let mut key = k.clone();
-                    if ui.add(egui::TextEdit::singleline(&mut key).desired_width(70.0)).changed() {
-                        rename = Some((k.clone(), key));
-                    }
-                    ui.add(egui::TextEdit::singleline(v).desired_width(ui.available_width() - 32.0));
-                    if ui.small_button("×").clicked() {
-                        remove = Some(k.clone());
-                    }
-                });
-            }
-            if let Some(k) = remove {
-                self.job.variables.remove(&k);
-            }
-            if let Some((old, new)) = rename
-                && !new.is_empty()
-                && !self.job.variables.contains_key(&new)
-            {
-                let v = self.job.variables.remove(&old).unwrap_or_default();
-                self.job.variables.insert(new, v);
-            }
-            if ui.button("+ variable").clicked() {
-                let mut n = 1;
-                while self.job.variables.contains_key(&format!("var{n}")) {
-                    n += 1;
-                }
-                self.job.variables.insert(format!("var{n}"), String::new());
-            }
-        });
-
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new("Job summary").default_open(true).show(ui, |ui| {
-            let p = &self.plan;
-            match p.bbox() {
-                Some(b) => {
-                    ui.label(format!("{} operation(s), {} data frames", p.ops.len(), p.data_frames()));
-                    ui.label(format!("bounding box {}", b.describe_mm()));
-                }
-                None => {
-                    ui.label("nothing to burn");
-                }
-            }
-            for e in &self.plan_errors {
-                ui.colored_label(Color32::from_rgb(220, 60, 60), e);
-            }
-        });
     }
 
-    fn properties_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Properties");
-        ui.separator();
+    fn editor(&mut self, ui: &mut egui::Ui) {
         let Some(i) = self.selected.filter(|&i| i < self.job.ops.len()) else {
-            ui.label("Select an operation, or add one with + Add.");
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Canvas: drag to move (snaps to 0.05 mm, Ctrl: 1 mm), wheel to zoom, right-drag to pan, double-click to fit. Arrows nudge 0.05 mm (Shift: 1 mm). Esc = STOP.").weak());
+            ui.add_space(6.0);
+            ui.label(RichText::new("Select an item to edit it.").weak());
             return;
         };
+        let can_frame = self.connected.is_some() && !self.running && self.frame_target(FrameScope::Item(i)).is_some();
         let base_dir = self.job.base_dir.clone();
-        let mut picked: Option<String> = None;
-        let want_pick: Option<(&str, &[&str])> = {
-            let op = &mut self.job.ops[i];
-            egui::Grid::new("op").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut op.name);
-                ui.end_row();
+        let act = &mut self.act;
+        let lock_ratio = &mut self.lock_ratio;
+        let view = self.views.get(i);
+        let frame = view.and_then(|v| v.frame);
+        let op = &mut self.job.ops[i];
+        ui.spacing_mut().slider_width = 170.0;
+
+        let auto = {
+            let mut o = op.clone();
+            o.name.clear();
+            o.label()
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(op.source.title()).strong().size(16.0));
+            ui.add(egui::TextEdit::singleline(&mut op.name).hint_text(auto).desired_width(f32::INFINITY))
+                .on_hover_text("Name in the item list");
+        });
+
+        // ---- what
+        if let Some(path) = op.source.path().map(str::to_string) {
+            ui.horizontal(|ui| {
+                let shown = sources::resolve(&path, &base_dir);
+                let name = shown.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(path.clone());
+                ui.label(RichText::new(name).monospace()).on_hover_text(shown.display().to_string());
+                if ui.small_button("Replace…").clicked() {
+                    act.push(Action::ReplaceFile(i));
+                }
+            });
+        }
+        let modes = op.source.modes();
+        if modes.len() > 1 {
+            ui.horizontal(|ui| {
                 ui.label("Mode");
+                for &m in modes {
+                    let hint = match m {
+                        Mode::Raster => "Scan line by line and burn the filled areas (engraving)",
+                        Mode::Vector => "Follow the paths with the beam (cutting, outlines)",
+                    };
+                    ui.selectable_value(&mut op.mode, m, m.label()).on_hover_text(hint);
+                }
+            });
+        }
+        match &mut op.source {
+            Source::Image(s) => {
                 ui.horizontal(|ui| {
-                    for &m in op.source.modes() {
-                        ui.selectable_value(&mut op.mode, m, m.as_str());
+                    for p in [ImageProcess::Threshold, ImageProcess::Dither, ImageProcess::Grayscale] {
+                        let hint = match p {
+                            ImageProcess::Threshold => "Pixels darker than the threshold burn. Logos, text, line art.",
+                            ImageProcess::Dither => "Shades become dot density, in one pass. Photos.",
+                            ImageProcess::Grayscale => "One pass per tone, each at its own power: real shades. Slower.",
+                        };
+                        ui.selectable_value(&mut s.process, p, p.label()).on_hover_text(hint);
+                    }
+                });
+                egui::Grid::new("image").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    if s.process == ImageProcess::Threshold {
+                        ui.label("Threshold");
+                        ui.add(egui::Slider::new(&mut s.threshold, 0..=255))
+                            .on_hover_text("Pixels darker than this burn");
+                        ui.end_row();
+                    }
+                    if s.process == ImageProcess::Grayscale {
+                        ui.label("Tones");
+                        ui.add(egui::Slider::new(&mut s.levels, 2..=16)).on_hover_text("One pass per tone");
+                        ui.end_row();
+                    }
+                    ui.label("Brightness");
+                    ui.add(egui::Slider::new(&mut s.brightness, -100.0..=100.0).step_by(1.0));
+                    ui.end_row();
+                    ui.label("Contrast");
+                    ui.add(egui::Slider::new(&mut s.contrast, -100.0..=100.0).step_by(1.0));
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut s.invert, "Invert (burn the light areas)");
+                    ui.end_row();
+                });
+            }
+            Source::Svg(s) => {
+                if op.mode == Mode::Raster {
+                    ui.checkbox(&mut s.invert, "Invert (burn the empty areas)");
+                }
+            }
+            Source::Dxf(d) => {
+                ui.horizontal(|ui| {
+                    ui.label("Layers");
+                    let mut layers = d.layers.join(", ");
+                    let edit = egui::TextEdit::singleline(&mut layers).hint_text("all").desired_width(f32::INFINITY);
+                    if ui.add(edit).changed() {
+                        d.layers = layers.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    }
+                });
+            }
+            Source::Text(t) => {
+                ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2).desired_width(f32::INFINITY));
+                egui::Grid::new("text").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Font");
+                    font_picker(ui, &mut t.font);
+                    ui.end_row();
+                    ui.label("Align");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut t.align, Align::Left, "Left");
+                        ui.selectable_value(&mut t.align, Align::Center, "Center");
+                        ui.selectable_value(&mut t.align, Align::Right, "Right");
+                    });
+                    ui.end_row();
+                });
+            }
+            Source::Qr(q) => {
+                ui.add(
+                    egui::TextEdit::multiline(&mut q.data)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Text or URL"),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Error correction").on_hover_text("Share of the code that can be damaged");
+                    for (l, pct) in [("L", "7 %"), ("M", "15 %"), ("Q", "25 %"), ("H", "30 %")] {
+                        if ui.selectable_label(q.ecc.eq_ignore_ascii_case(l), l).on_hover_text(pct).clicked() {
+                            q.ecc = l.into();
+                        }
+                    }
+                });
+                ui.label(RichText::new(format!("Module {:.2} mm", q.module_mm)).weak());
+            }
+            Source::Shape(s) => {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut s.shape, ShapeKind::Rect, "Rectangle");
+                    ui.selectable_value(&mut s.shape, ShapeKind::Circle, "Circle");
+                    ui.selectable_value(&mut s.shape, ShapeKind::Cross, "Cross");
+                });
+            }
+            Source::Ruler(r) => {
+                egui::Grid::new("ruler").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Tick step");
+                    ui.add(mm_drag(&mut r.step_mm, 0.1..=10.0));
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut r.labels, "Labels every 10 mm");
+                    ui.end_row();
+                    ui.label("Label size");
+                    ui.add(mm_drag(&mut r.label_mm, 0.5..=10.0));
+                    ui.end_row();
+                    ui.label("Font");
+                    font_picker(ui, &mut r.font);
+                    ui.end_row();
+                });
+            }
+        }
+
+        // ---- laser
+        section(ui, "Laser");
+        let gray = op.is_grayscale();
+        egui::Grid::new("laser").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label(if gray { "Max power" } else { "Power" });
+            ui.add(egui::Slider::new(&mut op.power, 0.0..=100.0).step_by(0.5).suffix(" %")).on_hover_text(if gray {
+                "Power of the darkest tone"
+            } else {
+                "Laser power"
+            });
+            ui.end_row();
+            if gray {
+                let max = op.power;
+                ui.label("Min power");
+                ui.add(egui::Slider::new(&mut op.min_power, 0.0..=max).step_by(0.5).suffix(" %"))
+                    .on_hover_text("Power of the lightest tone");
+                ui.end_row();
+            }
+            ui.label("Burn time").on_hover_text(DEPTH_HINT);
+            ui.add(egui::Slider::new(&mut op.depth, 0..=P::DEPTH_MAX)).on_hover_text(DEPTH_HINT);
+            ui.end_row();
+            ui.label("Passes");
+            ui.add(egui::DragValue::new(&mut op.passes).range(1..=50))
+                .on_hover_text("Repeat the whole item: more passes cut deeper");
+            ui.end_row();
+        });
+        op.min_power = op.min_power.clamp(0.0, op.power);
+
+        if op.mode == Mode::Vector {
+            section(ui, "Outlines");
+            egui::Grid::new("outlines").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Count").on_hover_text(OUTLINE_HINT);
+                ui.add(egui::DragValue::new(&mut op.outlines).range(1..=50)).on_hover_text(OUTLINE_HINT);
+                ui.end_row();
+                if op.outlines > 1 {
+                    ui.label("Spacing");
+                    ui.add(
+                        egui::DragValue::new(&mut op.outline_spacing_mm)
+                            .speed(0.005)
+                            .range(0.02..=2.0)
+                            .fixed_decimals(2)
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text("Distance between outlines; about the beam width");
+                    ui.end_row();
+                    ui.label("Side");
+                    ui.horizontal(|ui| {
+                        for (side, hint) in [
+                            (Side::Outside, "Away from the material: a cut-out part keeps its exact size"),
+                            (Side::Inside, "Into the material: a hole keeps its exact size"),
+                            (Side::Centered, "Centred on the path"),
+                        ] {
+                            ui.selectable_value(&mut op.outline_side, side, side.label()).on_hover_text(hint);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        }
+
+        // ---- placement
+        section(ui, "Size and position");
+        if let Some([x, y, w, h]) = frame {
+            let forced = op.source.keeps_aspect();
+            let locked = forced || *lock_ratio;
+            egui::Grid::new("place").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Size");
+                ui.horizontal(|ui| {
+                    let (mut nw, mut nh) = (w, h);
+                    let rw = ui.add(mm_drag(&mut nw, 0.1..=1000.0));
+                    ui.label("×");
+                    let rh = ui.add(mm_drag(&mut nh, 0.1..=1000.0));
+                    if rw.changed() && w > 0.0 {
+                        let f = nw / w;
+                        act.push(Action::Resize(i, f, if locked { f } else { 1.0 }, (0.0, 0.0)));
+                    } else if rh.changed() && h > 0.0 {
+                        let f = nh / h;
+                        act.push(Action::Resize(i, if locked { f } else { 1.0 }, f, (0.0, 0.0)));
+                    }
+                    let hint = if forced { "This item always keeps its proportions" } else { "Keep proportions" };
+                    let lock =
+                        ui.add_enabled(!forced, egui::Button::selectable(locked, "Keep ratio")).on_hover_text(hint);
+                    if lock.clicked() {
+                        *lock_ratio = !*lock_ratio;
                     }
                 });
                 ui.end_row();
-                ui.label("X");
-                ui.add(mm_value(&mut op.x_mm, 0.0..=200.0));
-                ui.end_row();
-                ui.label("Y");
-                ui.add(mm_value(&mut op.y_mm, 0.0..=200.0));
-                ui.end_row();
-                ui.label("Power");
-                ui.add(egui::Slider::new(&mut op.power, 0.0..=100.0).step_by(0.1).fixed_decimals(1).suffix(" %"));
-                ui.end_row();
-                ui.label("Depth").on_hover_text(
-                    "Vendor \"carving depth\": dwell per pixel, unit unknown (0-100). Calibrate with a test grid.",
-                );
-                ui.add(egui::Slider::new(&mut op.depth, 0..=P::DEPTH_MAX));
-                ui.end_row();
-                ui.label("Passes");
-                ui.add(egui::DragValue::new(&mut op.passes).range(1..=50));
+                ui.label("Position").on_hover_text("Top-left corner, from the top-left of the bed");
+                ui.horizontal(|ui| {
+                    let (mut nx, mut ny) = (x, y);
+                    ui.label("X");
+                    if ui.add(mm_drag(&mut nx, -1000.0..=1000.0)).changed() {
+                        op.x_mm = snap(op.x_mm + nx - x, P::PITCH_MM);
+                    }
+                    ui.label("Y");
+                    if ui.add(mm_drag(&mut ny, -1000.0..=1000.0)).changed() {
+                        op.y_mm = snap(op.y_mm + ny - y, P::PITCH_MM);
+                    }
+                });
                 ui.end_row();
             });
-            ui.separator();
-            ui.label(egui::RichText::new(format!("Source: {}", op.source.kind())).strong());
-            source_editor(ui, &mut op.source)
-        };
-        if let Some((name, exts)) = want_pick {
-            picked = self.pick_file(name, exts);
-        }
-        if let Some(p) = picked {
-            match &mut self.job.ops[i].source {
-                Source::Image(s) => s.path = p,
-                Source::Svg(s) => s.path = p,
-                Source::Dxf(s) => s.path = p,
-                _ => {}
-            }
-        }
-        // keep mode valid when the source type changes
-        let op = &mut self.job.ops[i];
-        if !op.source.modes().contains(&op.mode) {
-            op.mode = op.source.modes()[0];
+            ui.horizontal(|ui| {
+                if ui.button("Center").on_hover_text("Center on the bed").clicked() {
+                    act.push(Action::Center(i));
+                }
+                if ui.button("↺ 90°").on_hover_text("Rotate counter-clockwise").clicked() {
+                    act.push(Action::Rotate(i, 270));
+                }
+                if ui.button("↻ 90°").on_hover_text("Rotate clockwise").clicked() {
+                    act.push(Action::Rotate(i, 90));
+                }
+                if ui.selectable_label(op.mirror, "⇆ Mirror").on_hover_text("Mirror left-right").clicked() {
+                    act.push(Action::Mirror(i));
+                }
+            });
+        } else {
+            ui.label(RichText::new("Nothing to place.").weak());
         }
 
-        ui.separator();
-        if let Some(v) = self.views.get(i) {
-            if let Some(p) = &v.plan {
-                ui.label(egui::RichText::new(p.bbox().describe_mm()).monospace());
-                let detail = match &*p.geometry {
-                    Geometry::Raster(bm) => format!("raster: {} rows, {} burn px", p.frame_count(), bm.count()),
-                    Geometry::Vector(segs) => {
-                        let (burn, travel) = p.lengths_mm();
-                        format!("vector: {} segments, burn {burn:.1} mm, travel {travel:.1} mm", segs.len())
-                    }
-                };
-                ui.label(detail);
+        // ---- details
+        section(ui, "Details");
+        if let Some(v) = view {
+            let rows: usize = v.plans.iter().map(OpPlan::frame_count).sum();
+            let (burn, segs) = v.plans.iter().fold((0.0, 0), |(b, s), p| match &*p.geometry {
+                Geometry::Vector(g) => (b + p.lengths_mm().0 * p.passes as f64, s + g.len()),
+                Geometry::Raster(_) => (b, s),
+            });
+            if segs > 0 {
+                ui.label(RichText::new(format!("{segs} segments, {burn:.0} mm of line in total")).weak());
+            } else if rows > 0 {
+                let parts = if v.plans.len() > 1 { format!(" in {} tones", v.plans.len()) } else { String::new() };
+                ui.label(RichText::new(format!("{rows} lines to scan{parts}")).weak());
             }
-            if let Some(e) = &v.error {
-                ui.colored_label(Color32::from_rgb(220, 60, 60), e);
+            if let Some(d) = &v.duration {
+                ui.label(RichText::new(format!("Duration {d}")).weak()).on_hover_text(timing_hint(&self.timing));
             }
             for n in &v.notes {
-                ui.label(egui::RichText::new(format!("• {n}")).weak());
+                ui.label(RichText::new(format!("• {n}")).weak());
+            }
+            if let Some(e) = &v.error {
+                ui.colored_label(ERROR, e);
             }
         }
-        if base_dir.as_os_str().is_empty() {
-            ui.label(
-                egui::RichText::new("Relative paths resolve from the current directory until the job is saved.").weak(),
-            );
+        ui.add_space(4.0);
+        let frame_btn = egui::Button::new("Frame this item");
+        if ui
+            .add_enabled(can_frame, frame_btn)
+            .on_hover_text("Trace this item's outline with the low-power beam")
+            .on_disabled_hover_text("Connect the engraver first")
+            .clicked()
+        {
+            act.push(Action::Frame(FrameScope::Item(i)));
         }
     }
 
-    fn machine_panel(&mut self, ui: &mut egui::Ui) {
-        let connected = self.connected.is_some();
-        let idle = connected && !self.running && !self.busy;
-        ui.horizontal(|ui| {
-            // ---- STOP, always first and largest
-            let stop = egui::Button::new(egui::RichText::new("STOP").strong().size(20.0).color(Color32::WHITE))
-                .fill(Color32::from_rgb(200, 30, 30))
-                .min_size(Vec2::new(110.0, 44.0));
-            if ui.add_enabled(connected, stop).on_hover_text("Esc — aborts the job (sends 0x16) and switches framing off").clicked() {
-                self.stop();
-            }
-            ui.separator();
-
-            // ---- position
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(idle, egui::Button::new("Home")).clicked() {
-                        self.send(Cmd::Home);
+    fn head_panel(&mut self, ui: &mut egui::Ui) {
+        let idle = self.connected.is_some() && !self.running && self.pending == 0;
+        egui::CollapsingHeader::new("Laser head").default_open(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new("Home")).clicked() {
+                    self.act.push(Action::Machine(Cmd::Home));
+                }
+                let head = match self.head {
+                    Some((x, y)) => format!("at {:.2}, {:.2} mm", x as f64 * P::PITCH_MM, y as f64 * P::PITCH_MM),
+                    None => "position unknown (homes before moving)".into(),
+                };
+                ui.label(RichText::new(head).weak());
+            });
+            let step = (self.jog_mm / P::PITCH_MM).round() as i64;
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(idle, |ui| {
+                    for (label, d) in [("←", (-step, 0)), ("↑", (0, -step)), ("↓", (0, step)), ("→", (step, 0))]
+                    {
+                        if ui.button(label).clicked() {
+                            self.act.push(Action::Machine(Cmd::Jog(d.0, d.1)));
+                        }
                     }
-                    let head = match self.head {
-                        Some((x, y)) => format!("head {:.2}, {:.2} mm", x as f64 * P::PITCH_MM, y as f64 * P::PITCH_MM),
-                        None => "head position unknown".into(),
-                    };
-                    ui.label(egui::RichText::new(head).monospace());
                 });
-                ui.horizontal(|ui| {
-                    let step = (self.jog_step_mm / P::PITCH_MM).round() as i64;
-                    ui.add_enabled_ui(idle, |ui| {
-                        if ui.button("←").clicked() {
-                            self.send(Cmd::Jog(-step, 0));
-                        }
-                        if ui.button("↑").clicked() {
-                            self.send(Cmd::Jog(0, -step));
-                        }
-                        if ui.button("↓").clicked() {
-                            self.send(Cmd::Jog(0, step));
-                        }
-                        if ui.button("→").clicked() {
-                            self.send(Cmd::Jog(step, 0));
-                        }
-                    });
-                    egui::ComboBox::from_id_salt("jogstep").width(70.0).selected_text(format!("{} mm", self.jog_step_mm)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("jog").width(80.0).selected_text(format!("{} mm", self.jog_mm)).show_ui(
+                    ui,
+                    |ui| {
                         for s in [0.05, 0.1, 0.5, 1.0, 5.0, 10.0] {
-                            ui.selectable_value(&mut self.jog_step_mm, s, format!("{s} mm"));
+                            ui.selectable_value(&mut self.jog_mm, s, format!("{s} mm"));
+                        }
+                    },
+                );
+            });
+        });
+    }
+
+    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
+        let connected = self.connected.is_some();
+        let framing = self.framing_active();
+        let ready = self.can_start();
+        let can_frame = connected && !self.running && (framing || self.frame_target(FrameScope::Job).is_some());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let size = Vec2::new(130.0, 42.0);
+            let stop = egui::Button::new(RichText::new("■  STOP").size(18.0).strong().color(Color32::WHITE))
+                .fill(RED)
+                .min_size(size);
+            if ui.add_enabled(connected, stop).on_hover_text("Esc. Aborts the job, switches the beam off.").clicked() {
+                self.act.push(Action::Stop);
+            }
+            let frame = if framing {
+                egui::Button::new(RichText::new("■  Stop framing").size(16.0).color(Color32::WHITE)).fill(ORANGE)
+            } else {
+                egui::Button::new(RichText::new("◻  Frame").size(16.0))
+            };
+            let hint = "Trace the outline of the job with the low-power beam, to align the piece. It follows your \
+                        edits while on.";
+            if ui.add_enabled(can_frame, frame.min_size(size)).on_hover_text(hint).clicked() {
+                self.act.push(if framing { Action::FrameStop } else { Action::Frame(FrameScope::Job) });
+            }
+            let start = egui::Button::new(RichText::new("▶  Start").size(18.0).strong().color(Color32::WHITE))
+                .fill(GREEN)
+                .min_size(size);
+            if ui.add_enabled(ready.is_ok(), start).clicked() {
+                self.confirm = true;
+            }
+            if self.running {
+                let paused = self.control.paused.load(Ordering::SeqCst);
+                let label = if paused { "Resume" } else { "Pause" };
+                let pause = egui::Button::new(RichText::new(label).size(16.0)).min_size(Vec2::new(100.0, 42.0));
+                if ui.add(pause).on_hover_text("Holds the next line on the host side").clicked() {
+                    self.control.paused.store(!paused, Ordering::SeqCst);
+                }
+            }
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 70.0).max(100.0));
+                if self.running {
+                    if let Some(p) = &self.progress {
+                        let frac = p.step as f32 / p.total.max(1) as f32;
+                        let eta = p.eta.map(|e| format!(" · {} left", fmt_dur(e))).unwrap_or_default();
+                        let text = format!("{:.0} % · {}{eta}", frac * 100.0, fmt_dur(p.elapsed));
+                        ui.add(egui::ProgressBar::new(frac).text(text));
+                        ui.label(RichText::new(&p.label).weak().small());
+                    } else {
+                        ui.add(egui::ProgressBar::new(0.0).text("starting…").animate(true));
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if let Err(reason) = &ready {
+                            ui.label(RichText::new(reason).color(ORANGE));
+                        } else if self.framed_fp != Some(self.plan_fp) {
+                            ui.label(RichText::new("Ready. Frame first to check the position.").weak());
+                        } else {
+                            ui.label(RichText::new("Ready").color(GREEN));
+                        }
+                        if let Some(e) = &self.estimate {
+                            ui.label(RichText::new(format!("·  duration {e}")).weak())
+                                .on_hover_text(timing_hint(&self.timing));
                         }
                     });
-                });
-            });
-            ui.separator();
-
-            // ---- framing
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    let framing = self.framing.is_some() || self.pending_frame.is_some();
-                    let label = if framing { "Stop framing" } else { "Frame" };
-                    let target = self.frame_target();
-                    let btn = egui::Button::new(egui::RichText::new(label).strong()).min_size(Vec2::new(120.0, 26.0));
-                    let enabled = connected && !self.running && (framing || target.is_some());
-                    if ui.add_enabled(enabled, btn).on_hover_text("Trace the bounding box with the low-power beam to align the piece").clicked() {
-                        if framing {
-                            self.pending_frame = None;
-                            self.send(Cmd::FrameStop);
-                        } else {
-                            self.start_frame();
-                        }
+                    if let Some((s, err)) = &self.status {
+                        ui.label(RichText::new(s).color(if *err { ERROR } else { ui.visuals().weak_text_color() }));
                     }
-                    ui.selectable_value(&mut self.frame_scope, FrameScope::Job, "job");
-                    ui.selectable_value(&mut self.frame_scope, FrameScope::Selection, "selection");
-                });
-                ui.checkbox(&mut self.live_reframe, "follow edits while framing");
-                if let Some(r) = self.framing {
-                    ui.label(egui::RichText::new(format!("framing {}", r.describe_mm())).color(Color32::from_rgb(230, 80, 60)).monospace());
                 }
             });
-            ui.separator();
-
-            // ---- burn
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    let burn = egui::Button::new(egui::RichText::new("Burn…").strong()).min_size(Vec2::new(100.0, 26.0));
-                    let hint = if !connected {
-                        "connect first"
-                    } else if self.plan.ops.is_empty() {
-                        "nothing to burn"
-                    } else if !self.plan_errors.is_empty() {
-                        "fix the errors listed in the job summary"
-                    } else if self.framed_fp != Some(self.plan_fp) {
-                        "frame the job (scope: job) first — the interlock requires the current geometry to have been traced"
-                    } else {
-                        "confirm and start"
-                    };
-                    if ui.add_enabled(self.can_burn(), burn).on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
-                        self.confirm_open = true;
-                        self.confirm_checked = false;
-                    }
-                    let paused = self.control.paused.load(Ordering::SeqCst);
-                    if ui.add_enabled(self.running, egui::Button::new(if paused { "Resume" } else { "Pause" })).on_hover_text("Holds the next row/batch on the host side").clicked() {
-                        self.control.paused.store(!paused, Ordering::SeqCst);
-                    }
-                    if !self.running && connected && self.framed_fp != Some(self.plan_fp) && !self.plan.ops.is_empty() {
-                        ui.label(egui::RichText::new("frame first").weak());
-                    }
-                });
-                if let Some(p) = &self.progress {
-                    let frac = p.step as f32 / p.total.max(1) as f32;
-                    let eta = p.eta.map(|e| format!(", ETA {}", fmt_dur(e))).unwrap_or_default();
-                    ui.add(egui::ProgressBar::new(frac).desired_width(360.0).text(format!("{}/{}  {}{eta}", p.step, p.total, fmt_dur(p.elapsed))));
-                    ui.label(egui::RichText::new(&p.label).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(self.show_log, "Log").clicked() {
+                    self.show_log = !self.show_log;
                 }
-                match &self.last_result {
-                    Some(Ok(())) if !self.running => {
-                        ui.colored_label(Color32::from_rgb(60, 170, 90), "last job completed");
-                    }
-                    Some(Err(e)) if !self.running => {
-                        ui.colored_label(Color32::from_rgb(220, 60, 60), e);
-                    }
-                    _ => {}
-                }
-            });
-            ui.separator();
-
-            egui::CollapsingHeader::new("Experimental").default_open(false).show(ui, |ui| {
-                ui.label(egui::RichText::new("Hidden V2.7 commands; effect unconfirmed\n(suspected accessory/fan output).").weak());
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(idle, egui::Button::new("0xFD")).clicked() {
-                        self.send(Cmd::Aux(true));
-                    }
-                    if ui.add_enabled(idle, egui::Button::new("0xFE")).clicked() {
-                        self.send(Cmd::Aux(false));
-                    }
-                });
             });
         });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().id_salt("log").stick_to_bottom(true).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("log").stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             for line in self.log.iter().rev().take(300).rev() {
-                let mut t = egui::RichText::new(line).monospace().size(11.0);
-                if line.starts_with("error") || line.starts_with("job ended") {
-                    t = t.color(Color32::from_rgb(220, 60, 60));
+                let mut t = RichText::new(line).monospace().size(11.0);
+                if line.starts_with("error") {
+                    t = t.color(ERROR);
                 }
                 ui.label(t);
             }
@@ -982,148 +1769,207 @@ impl App {
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
-        if !self.confirm_open {
+        if !self.confirm {
             return;
         }
-        let modal = egui::Modal::new(egui::Id::unique("confirm-burn")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading("Start burning?");
+        if self.can_start().is_err() && !self.framing_active() {
+            self.confirm = false;
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::unique("confirm-start")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading("Start engraving?");
             ui.add_space(6.0);
             let p = &self.plan;
+            let items = self.job.ops.iter().zip(&self.views).filter(|(o, v)| o.enabled && !v.plans.is_empty()).count();
             if let Some(b) = p.bbox() {
-                ui.label(format!("{} operation(s) in {}", p.ops.len(), b.describe_mm()));
+                let mm = |v: u32| v as f64 * P::PITCH_MM;
+                ui.label(format!(
+                    "{items} item(s), {:.2} × {:.2} mm at ({:.2}, {:.2}) mm",
+                    mm(b.w),
+                    mm(b.h),
+                    mm(b.x),
+                    mm(b.y)
+                ));
             }
-            for line in p.summary() {
-                ui.label(egui::RichText::new(line).monospace().size(11.0));
+            if let Some(e) = &self.estimate {
+                ui.label(format!("Duration {e}")).on_hover_text(timing_hint(&self.timing));
             }
-            ui.add_space(8.0);
-            ui.checkbox(&mut self.confirm_checked, "Eye protection on, piece secured and framed, extraction suitable for the material, nothing flammable nearby.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let go = egui::Button::new(egui::RichText::new("Burn").strong().color(Color32::WHITE)).fill(Color32::from_rgb(200, 90, 20));
-                if ui.add_enabled(self.confirm_checked && self.can_burn(), go).clicked() {
-                    self.confirm_open = false;
-                    self.control = Control::new();
-                    self.running = true;
-                    self.progress = None;
-                    self.last_result = None;
-                    self.pending_frame = None;
-                    let plan = self.plan.clone();
-                    self.logln(format!("burn started: {} operation(s)", plan.ops.len()));
-                    self.send(Cmd::Run(plan, self.control.clone()));
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_open = false;
+            egui::CollapsingHeader::new("Details").default_open(false).show(ui, |ui| {
+                for line in p.summary() {
+                    ui.label(RichText::new(line).monospace().size(11.0));
                 }
             });
+            ui.add_space(6.0);
+            let mut frame_first = false;
+            if self.frame_req.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Framing…");
+                });
+            } else if self.framed_fp != Some(self.plan_fp) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("⚠ Not framed since the last change.").color(ORANGE));
+                    frame_first = ui.button("Frame first").clicked();
+                });
+            } else if self.framing.is_some() {
+                ui.label(RichText::new("Framed. The beam stops tracing when the job starts.").weak());
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Eye protection on, piece secured, fumes extracted. STOP or Esc aborts at any time.")
+                    .weak(),
+            );
+            ui.add_space(8.0);
+            let mut go = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let start = egui::Button::new(RichText::new("▶  Start").size(16.0).strong().color(Color32::WHITE))
+                    .fill(GREEN)
+                    .min_size(Vec2::new(120.0, 34.0));
+                let enabled = self.pending == 0;
+                go = ui.add_enabled(enabled, start).on_hover_text("Enter").clicked()
+                    || (enabled && ui.input(|i| i.key_pressed(Key::Enter)));
+                cancel = ui.add(egui::Button::new("Cancel").min_size(Vec2::new(90.0, 34.0))).clicked();
+            });
+            (go, cancel, frame_first)
         });
-        if modal.should_close() {
-            self.confirm_open = false;
+        let (go, cancel, frame_first) = modal.inner;
+        if frame_first {
+            self.start_frame(FrameScope::Job);
+        }
+        if go {
+            self.start_job();
+        } else if cancel || modal.should_close() {
+            self.confirm = false;
+        }
+    }
+
+    fn discard_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.discard else { return };
+        let what = match pending {
+            Pending::New => "start a new project",
+            Pending::Open(_) => "open another project",
+        };
+        let name = self
+            .job_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the current project".into());
+        let modal = egui::Modal::new(egui::Id::unique("discard")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Unsaved changes");
+            ui.label(format!("Save the changes to {name} before you {what}?"));
+            ui.add_space(8.0);
+            let mut choice = 0;
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = 1;
+                }
+                if ui.button("Discard changes").clicked() {
+                    choice = 2;
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = 3;
+                }
+            });
+            choice
+        });
+        match modal.inner {
+            1 => {
+                self.save(None);
+                if !self.dirty()
+                    && let Some(p) = self.discard.take()
+                {
+                    self.proceed(p);
+                }
+            }
+            2 => {
+                if let Some(p) = self.discard.take() {
+                    self.proceed(p);
+                }
+            }
+            3 => self.discard = None,
+            _ if modal.should_close() => self.discard = None,
+            _ => {}
         }
     }
 
     // ------------------------------------------------------------ canvas
 
-    fn to_screen(&self, origin: Pos2, x_mm: f32, y_mm: f32) -> Pos2 {
-        origin + self.view.pan + Vec2::new(x_mm, y_mm) * self.view.zoom
-    }
-
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
-        let (aw, ah) = self.area_mm();
-        if !self.view.fitted || resp.double_clicked() {
-            let zoom = ((rect.width() - 70.0) / aw).min((rect.height() - 60.0) / ah).max(1.0);
-            self.view.zoom = zoom;
-            self.view.pan =
-                Vec2::new((rect.width() - aw * zoom) / 2.0 + 10.0, (rect.height() - ah * zoom) / 2.0 + 10.0);
-            self.view.fitted = true;
-        }
-        let o = rect.min;
         let dark = ui.visuals().dark_mode;
-        let (bg, area_fill, grid_minor, grid_major, ink) = if dark {
-            (
-                Color32::from_gray(24),
-                Color32::from_gray(40),
-                Color32::from_gray(52),
-                Color32::from_gray(75),
-                Color32::from_rgb(255, 170, 60),
-            )
-        } else {
-            (
-                Color32::from_gray(225),
-                Color32::WHITE,
-                Color32::from_gray(236),
-                Color32::from_gray(200),
-                Color32::from_gray(20),
-            )
-        };
-        painter.rect_filled(rect, 0.0, bg);
-        let area = egui::Rect::from_min_max(self.to_screen(o, 0.0, 0.0), self.to_screen(o, aw, ah));
-        painter.rect_filled(area, 0.0, area_fill);
-        let painter = painter.with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, if dark { Color32::from_gray(30) } else { Color32::from_gray(214) });
+        let (aw, ah) = self.area_mm();
+        // always fitted and centred: the whole bed is visible at any window size
+        let avail = egui::Rect::from_min_max(rect.min + Vec2::new(42.0, 28.0), rect.max - Vec2::new(18.0, 30.0));
+        let z = (avail.width() as f64 / aw).min(avail.height() as f64 / ah).max(0.1);
+        let bed = egui::Rect::from_center_size(avail.center(), Vec2::new((aw * z) as f32, (ah * z) as f32));
+        let tf = Tf { origin: bed.min, z };
+        painter.rect_filled(bed, 0.0, BED);
 
-        // grid: 1 mm (when legible), 5 mm, 10 mm with labels
-        let z = self.view.zoom;
-        let text_col = ui.visuals().weak_text_color();
+        // grid: 1 mm when legible, 5 mm, 10 mm with labels
+        let (minor, mid, major) =
+            (Color32::from_rgb(236, 231, 221), Color32::from_rgb(222, 214, 200), Color32::from_rgb(198, 188, 170));
+        let label_col = if dark { Color32::from_gray(150) } else { Color32::from_gray(90) };
         let font = egui::FontId::monospace(10.0);
-        let mut mm = 0;
-        while mm as f32 <= aw {
-            let x = area.left() + mm as f32 * z;
-            let (show, col) = if mm % 10 == 0 {
-                (true, grid_major)
-            } else if mm % 5 == 0 {
-                (z >= 3.0, grid_minor)
-            } else {
-                (z >= 7.0, grid_minor)
-            };
-            if show {
-                painter.line_segment([Pos2::new(x, area.top()), Pos2::new(x, area.bottom())], Stroke::new(1.0, col));
+        for (len, vertical) in [(aw, true), (ah, false)] {
+            for mm in 0..=(len.floor() as i32) {
+                let col = match mm {
+                    _ if mm % 10 == 0 => major,
+                    _ if mm % 5 == 0 => mid,
+                    _ if z >= 5.0 => minor,
+                    _ => continue,
+                };
+                let v = mm as f64;
+                let (a, b) = if vertical { (tf.pos(v, 0.0), tf.pos(v, ah)) } else { (tf.pos(0.0, v), tf.pos(aw, v)) };
+                painter.line_segment([a, b], Stroke::new(1.0, col));
+                if mm % 10 == 0 {
+                    let (p, align) = if vertical {
+                        (a - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM)
+                    } else {
+                        (a - Vec2::new(5.0, 0.0), Align2::RIGHT_CENTER)
+                    };
+                    painter.text(p, align, mm.to_string(), font.clone(), label_col);
+                }
             }
-            if mm % 10 == 0 {
-                painter.text(Pos2::new(x, area.top() - 3.0), egui::Align2::CENTER_BOTTOM, mm, font.clone(), text_col);
-            }
-            mm += 1;
         }
-        let mut mm = 0;
-        while mm as f32 <= ah {
-            let y = area.top() + mm as f32 * z;
-            let (show, col) = if mm % 10 == 0 {
-                (true, grid_major)
-            } else if mm % 5 == 0 {
-                (z >= 3.0, grid_minor)
-            } else {
-                (z >= 7.0, grid_minor)
-            };
-            if show {
-                painter.line_segment([Pos2::new(area.left(), y), Pos2::new(area.right(), y)], Stroke::new(1.0, col));
-            }
-            if mm % 10 == 0 {
-                painter.text(Pos2::new(area.left() - 4.0, y), egui::Align2::RIGHT_CENTER, mm, font.clone(), text_col);
-            }
-            mm += 1;
-        }
-        painter.rect_stroke(area, 0.0, Stroke::new(1.5, grid_major), egui::StrokeKind::Outside);
+        painter.rect_stroke(bed, 0.0, Stroke::new(1.0, major), egui::StrokeKind::Outside);
+        painter.text(
+            bed.right_bottom() + Vec2::new(0.0, 4.0),
+            Align2::RIGHT_TOP,
+            format!("bed {aw:.0} × {ah:.0} mm"),
+            egui::FontId::proportional(11.0),
+            label_col,
+        );
 
-        // operations
-        let px = P::PITCH_MM as f32;
-        let mut used_textures = Vec::new();
+        // ---- items
+        let painter = painter.with_clip_rect(rect);
+        let preview = match &self.gesture {
+            Some(Gesture::Resize { op, frame, corner, scale }) => Some((*op, *frame, resized(*frame, *corner, *scale))),
+            _ => None,
+        };
+        let pitch = P::PITCH_MM;
+        let mut used = Vec::new();
         for (i, (op, v)) in self.job.ops.iter().zip(&self.views).enumerate() {
-            let Some(p) = &v.plan else { continue };
-            let tint = if !op.enabled {
-                ink.gamma_multiply(0.25)
-            } else if v.error.is_some() {
-                Color32::from_rgb(220, 60, 60)
-            } else {
-                ink
+            // bed mm -> screen, with a resize preview applied
+            let map = |x: f64, y: f64| match preview {
+                Some((j, [fx, fy, fw, fh], [nx, ny, nw, nh])) if j == i => {
+                    tf.pos(nx + (x - fx) * nw / fw.max(1e-9), ny + (y - fy) * nh / fh.max(1e-9))
+                }
+                _ => tf.pos(x, y),
             };
-            let r = egui::Rect::from_min_size(
-                self.to_screen(o, p.x as f32 * px, p.y as f32 * px),
-                Vec2::new(p.width as f32 * px * z, p.height as f32 * px * z),
-            );
-            match &*p.geometry {
-                Geometry::Raster(bm) => {
-                    if bm.width <= 8192 && bm.height <= 8192 {
+            let faded = !op.enabled;
+            for p in &v.plans {
+                let (x0, y0) = (p.x as f64 * pitch, p.y as f64 * pitch);
+                match &*p.geometry {
+                    Geometry::Raster(bm) => {
+                        if bm.width > 8192 || bm.height > 8192 {
+                            continue;
+                        }
                         let tex = self.textures.entry(p.geom_hash).or_insert_with(|| {
                             let pixels = bm
                                 .data
@@ -1133,185 +1979,277 @@ impl App {
                             let img = egui::ColorImage::new([bm.width, bm.height], pixels);
                             ui.ctx().load_texture(format!("op-{:x}", p.geom_hash), img, egui::TextureOptions::NEAREST)
                         });
-                        used_textures.push(p.geom_hash);
-                        painter.image(tex.id(), r, egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
+                        used.push(p.geom_hash);
+                        let r = egui::Rect::from_min_max(
+                            map(x0, y0),
+                            map(x0 + p.width as f64 * pitch, y0 + p.height as f64 * pitch),
+                        );
+                        let uv = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                        painter.image(tex.id(), r, uv, burn_tint(p.power, faded));
                     }
-                }
-                Geometry::Vector(segs) => {
-                    let stroke = Stroke::new(1.2, tint);
-                    let base = (p.x as f32 * px, p.y as f32 * px);
-                    for s in segs {
-                        let a = self.to_screen(o, base.0 + s[0] as f32 * px, base.1 + s[1] as f32 * px);
-                        let b = self.to_screen(o, base.0 + s[2] as f32 * px, base.1 + s[3] as f32 * px);
-                        painter.line_segment([a, b], stroke);
+                    Geometry::Vector(segs) => {
+                        let stroke = Stroke::new(1.2, if faded { LINE.gamma_multiply(0.25) } else { LINE });
+                        for s in segs {
+                            let a = map(x0 + s[0] as f64 * pitch, y0 + s[1] as f64 * pitch);
+                            let b = map(x0 + s[2] as f64 * pitch, y0 + s[3] as f64 * pitch);
+                            painter.line_segment([a, b], stroke);
+                        }
                     }
                 }
             }
-            if self.selected == Some(i) {
-                let sel = ui.visuals().selection.stroke.color;
-                painter.rect_stroke(r.expand(2.0), 0.0, Stroke::new(1.5, sel), egui::StrokeKind::Outside);
-                painter.text(
-                    r.left_top() + Vec2::new(0.0, -4.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    op.label(),
-                    egui::FontId::proportional(11.0),
-                    sel,
-                );
+            if v.error.is_some()
+                && let Some(f) = v.frame
+            {
+                dashed_rect(&painter, tf.rect(f), Stroke::new(1.5, ERROR));
             }
         }
-        self.textures.retain(|k, _| used_textures.contains(k));
+        self.textures.retain(|k, _| used.contains(k));
 
-        // job bounding box (what "Frame: job" traces)
-        if let Some(b) = self.plan.bbox() {
-            let r = egui::Rect::from_min_max(
-                self.to_screen(o, b.x as f32 * px, b.y as f32 * px),
-                self.to_screen(o, (b.x + b.w) as f32 * px, (b.y + b.h) as f32 * px),
-            );
-            let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-            painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_rgb(80, 160, 255)), 6.0, 4.0));
+        // ---- interaction
+        let editable = !self.running;
+        let sel = self.selected.filter(|&i| i < self.views.len());
+        let item_box = |i: usize| -> Option<[f64; 4]> {
+            match preview {
+                Some((j, _, r)) if j == i => Some(r),
+                _ => self.views.get(i)?.frame,
+            }
+        };
+        let handle_at = |pos: Pos2| -> Option<(f64, f64)> {
+            let r = tf.rect(item_box(sel?)?);
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].into_iter().find(|&(cx, cy)| {
+                let c =
+                    Pos2::new(if cx > 0.5 { r.right() } else { r.left() }, if cy > 0.5 { r.bottom() } else { r.top() });
+                (c - pos).length() <= 9.0
+            })
+        };
+        let item_at = |pos: Pos2| -> Option<usize> {
+            let inside = |i: usize| item_box(i).is_some_and(|f| tf.rect(f).expand(3.0).contains(pos));
+            // the selection first, so overlapped items stay reachable
+            sel.filter(|&i| inside(i)).or_else(|| (0..self.views.len()).rev().find(|&i| inside(i)))
+        };
+        let pointer = resp.hover_pos();
+        let hovered = pointer.and_then(item_at);
+        let hovered_handle = pointer.and_then(handle_at);
+
+        // selection and hover outlines
+        if let Some(i) = hovered.filter(|&i| Some(i) != sel && self.gesture.is_none())
+            && let Some(f) = item_box(i)
+        {
+            dashed_rect(&painter, tf.rect(f), Stroke::new(1.0, BLUE));
         }
-        // live framing rectangle
+        if let Some(i) = sel
+            && let Some(f) = item_box(i)
+        {
+            let r = tf.rect(f);
+            painter.rect_stroke(r, 0.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Outside);
+            if editable {
+                for c in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()] {
+                    let h = egui::Rect::from_center_size(c, Vec2::splat(8.0));
+                    painter.rect_filled(h, 1.0, Color32::WHITE);
+                    painter.rect_stroke(h, 1.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Inside);
+                }
+            }
+            painter.text(
+                r.left_top() + Vec2::new(0.0, -6.0),
+                Align2::LEFT_BOTTOM,
+                format!("{:.2} × {:.2} mm", f[2], f[3]),
+                egui::FontId::proportional(11.0),
+                BLUE,
+            );
+        }
+
+        // live framing rectangle and head
         if let Some(f) = self.framing {
-            let r = egui::Rect::from_min_max(
-                self.to_screen(o, f.x as f32 * px, f.y as f32 * px),
-                self.to_screen(o, (f.x + f.w) as f32 * px, (f.y + f.h) as f32 * px),
+            let r = tf.rect([f.x as f64 * pitch, f.y as f64 * pitch, f.w as f64 * pitch, f.h as f64 * pitch]);
+            painter.rect_stroke(r, 0.0, Stroke::new(2.5, BEAM), egui::StrokeKind::Middle);
+            painter.text(
+                r.left_bottom() + Vec2::new(0.0, 4.0),
+                Align2::LEFT_TOP,
+                "framing",
+                egui::FontId::proportional(11.0),
+                BEAM,
             );
-            painter.rect_stroke(r, 0.0, Stroke::new(2.5, Color32::from_rgb(230, 50, 40)), egui::StrokeKind::Middle);
         }
-        // head
         if let Some((hx, hy)) = self.head {
-            let c = self.to_screen(o, hx as f32 * px, hy as f32 * px);
-            let s = Stroke::new(1.5, Color32::from_rgb(40, 140, 230));
-            painter.line_segment([c - Vec2::new(8.0, 0.0), c + Vec2::new(8.0, 0.0)], s);
-            painter.line_segment([c - Vec2::new(0.0, 8.0), c + Vec2::new(0.0, 8.0)], s);
+            let c = tf.pos(hx as f64 * pitch, hy as f64 * pitch);
+            let s = Stroke::new(1.5, Color32::from_rgb(20, 110, 200));
+            painter.line_segment([c - Vec2::new(9.0, 0.0), c + Vec2::new(9.0, 0.0)], s);
+            painter.line_segment([c - Vec2::new(0.0, 9.0), c + Vec2::new(0.0, 9.0)], s);
             painter.circle_stroke(c, 4.0, s);
         }
 
-        // ---- interaction
-        let pointer = resp.hover_pos();
-        let to_mm = |p: Pos2, view: &View| {
-            let v = (p - o - view.pan) / view.zoom;
-            (v.x as f64, v.y as f64)
-        };
-        if let Some(pos) = pointer {
-            let (x, y) = to_mm(pos, &self.view);
-            painter.text(
-                rect.left_bottom() + Vec2::new(8.0, -6.0),
-                egui::Align2::LEFT_BOTTOM,
-                format!("x {x:7.2} mm   y {y:7.2} mm"),
-                egui::FontId::monospace(12.0),
-                ui.visuals().text_color(),
-            );
-            let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let factor = (scroll / 300.0).exp();
-                let new_zoom = (self.view.zoom * factor).clamp(1.0, 400.0);
-                let anchor = pos - o - self.view.pan;
-                self.view.pan += anchor - anchor * (new_zoom / self.view.zoom);
-                self.view.zoom = new_zoom;
+        // cursor
+        if editable && pointer.is_some() {
+            let corner_icon = |(cx, cy): (f64, f64)| {
+                if (cx > 0.5) == (cy > 0.5) { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw }
+            };
+            let icon = match &self.gesture {
+                Some(Gesture::Move { .. }) => Some(egui::CursorIcon::Grabbing),
+                Some(Gesture::Resize { corner, .. }) => Some(corner_icon(*corner)),
+                None => hovered_handle.map(corner_icon).or(hovered.map(|_| egui::CursorIcon::Grab)),
+            };
+            if let Some(icon) = icon {
+                ui.ctx().set_cursor_icon(icon);
             }
         }
-        let editable = !self.running;
-        let hit = |app: &App, pos: Pos2| -> Option<usize> {
-            let (x, y) = to_mm(pos, &app.view);
-            let (x, y) = ((x / P::PITCH_MM) as i64, (y / P::PITCH_MM) as i64);
-            let slop = (4.0 / app.view.zoom as f64 / P::PITCH_MM) as i64;
-            app.views.iter().enumerate().rev().find_map(|(i, v)| {
-                let p = v.plan.as_ref()?;
-                let inside = x >= p.x as i64 - slop
-                    && x <= (p.x + p.width) as i64 + slop
-                    && y >= p.y as i64 - slop
-                    && y <= (p.y + p.height) as i64 + slop;
-                inside.then_some(i)
-            })
-        };
+
+        // gestures
+        let shift = ui.input(|i| i.modifiers.shift);
+        if editable
+            && resp.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        {
+            if let (Some(i), Some(corner)) = (sel, handle_at(pos))
+                && let Some(frame) = item_box(i)
+            {
+                self.gesture = Some(Gesture::Resize { op: i, frame, corner, scale: (1.0, 1.0) });
+            } else if let Some(i) = item_at(pos)
+                && let Some(frame) = item_box(i)
+            {
+                self.selected = Some(i);
+                let op = &self.job.ops[i];
+                self.gesture = Some(Gesture::Move { op: i, start: (op.x_mm, op.y_mm), frame, grab: tf.mm(pos) });
+            }
+        }
+        if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged()) {
+            let (mx, my) = tf.mm(pos);
+            match &mut self.gesture {
+                Some(Gesture::Move { op, start, frame, grab }) if *op < self.job.ops.len() => {
+                    let step = if shift { 1.0 } else { pitch };
+                    let [fx, fy, fw, fh] = *frame;
+                    // keep the item on the bed when it fits
+                    let clamp = |v: f64, lo: f64, hi: f64| if lo <= hi { v.clamp(lo, hi) } else { v };
+                    let o = &mut self.job.ops[*op];
+                    o.x_mm = clamp(snap(start.0 + mx - grab.0, step), start.0 - fx, start.0 + aw - fw - fx);
+                    o.y_mm = clamp(snap(start.1 + my - grab.1, step), start.1 - fy, start.1 + ah - fh - fy);
+                }
+                Some(Gesture::Resize { op, frame, corner, scale }) if *op < self.job.ops.len() => {
+                    let [x, y, w, h] = *frame;
+                    let (cx, cy) = *corner;
+                    let anchor = (x + (1.0 - cx) * w, y + (1.0 - cy) * h);
+                    let dir = |c: f64| if c > 0.5 { 1.0 } else { -1.0 };
+                    let (dw, dh) = ((mx - anchor.0) * dir(cx), (my - anchor.1) * dir(cy));
+                    let locked = self.lock_ratio || self.job.ops[*op].source.keeps_aspect();
+                    let (sx, sy) = if locked {
+                        // project on the diagonal: the box follows the pointer smoothly
+                        let f = (dw * w + dh * h) / (w * w + h * h).max(1e-9);
+                        (f, f)
+                    } else {
+                        (dw / w.max(1e-9), dh / h.max(1e-9))
+                    };
+                    let min = 0.5 / w.min(h).max(1e-9);
+                    *scale = (sx.max(min), sy.max(min));
+                }
+                _ => {}
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(Gesture::Resize { op, corner, scale, .. }) = self.gesture.take()
+                && ((scale.0 - 1.0).abs() > 1e-4 || (scale.1 - 1.0).abs() > 1e-4)
+            {
+                self.act.push(Action::Resize(op, scale.0, scale.1, (1.0 - corner.0, 1.0 - corner.1)));
+            }
+            self.gesture = None;
+        }
         if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.selected = hit(self, pos);
+            self.selected = item_at(pos);
         }
-        if resp.drag_started_by(egui::PointerButton::Primary)
-            && editable
-            && let Some(pos) = resp.interact_pointer_pos()
-            && let Some(i) = hit(self, pos)
-        {
-            self.selected = Some(i);
-            let op = &self.job.ops[i];
-            self.drag = Some(Drag { op: i, start_mm: (op.x_mm, op.y_mm), start_pointer: pos });
+
+        // pointer position
+        if let Some(pos) = pointer {
+            let (x, y) = tf.mm(pos);
+            painter.text(
+                rect.left_bottom() + Vec2::new(10.0, -8.0),
+                Align2::LEFT_BOTTOM,
+                format!("X {x:6.2}   Y {y:6.2} mm"),
+                egui::FontId::monospace(12.0),
+                label_col,
+            );
         }
-        if resp.drag_started_by(egui::PointerButton::Secondary) || resp.drag_started_by(egui::PointerButton::Middle) {
-            self.pan_drag = true;
+
+        // empty bed
+        if self.job.ops.is_empty() {
+            let r = egui::Rect::from_center_size(bed.center(), Vec2::new(300.0, 54.0));
+            let add = egui::Button::new(RichText::new("+  Add a file to engrave…").size(18.0).strong());
+            if ui.put(r, add).clicked() {
+                self.act.push(Action::AddFiles);
+            }
+            painter.text(
+                r.center_bottom() + Vec2::new(0.0, 14.0),
+                Align2::CENTER_TOP,
+                "Image (PNG, JPEG…), SVG or DXF.  Text, QR codes and shapes: Add ▾",
+                egui::FontId::proportional(13.0),
+                Color32::from_gray(110),
+            );
         }
-        if self.pan_drag {
-            self.view.pan += resp.drag_delta();
-        }
-        if let (Some(d), Some(pos)) = (&self.drag, resp.interact_pointer_pos())
-            && d.op < self.job.ops.len()
-        {
-            let delta = (pos - d.start_pointer) / self.view.zoom;
-            let snap = if ui.ctx().input(|i| i.modifiers.ctrl) { 1.0 } else { P::PITCH_MM };
-            let q = |v: f64| ((v / snap).round() * snap * 1e6).round() / 1e6;
-            let op = &mut self.job.ops[d.op];
-            op.x_mm = q((d.start_mm.0 + delta.x as f64).max(0.0));
-            op.y_mm = q((d.start_mm.1 + delta.y as f64).max(0.0));
-        }
-        if resp.drag_stopped() {
-            self.drag = None;
-            self.pan_drag = false;
+        if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(110));
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Drop to add",
+                egui::FontId::proportional(26.0),
+                Color32::WHITE,
+            );
         }
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            && (self.running || self.framing.is_some() || self.pending_frame.is_some())
-        {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && (self.running || self.framing_active()) {
             self.stop();
         }
-        if ctx.egui_wants_keyboard_input() || self.running {
+        if ctx.egui_wants_keyboard_input() || self.confirm || self.discard.is_some() {
             return;
         }
+        let sc = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        if sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            self.act.push(Action::SaveAs);
+        }
+        if sc(Modifiers::COMMAND, Key::S) {
+            self.act.push(Action::Save);
+        }
+        if self.running {
+            return;
+        }
+        if sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || sc(Modifiers::COMMAND, Key::Y) {
+            self.act.push(Action::Redo);
+        }
+        if sc(Modifiers::COMMAND, Key::Z) {
+            self.act.push(Action::Undo);
+        }
+        if sc(Modifiers::COMMAND, Key::O) {
+            self.act.push(Action::AddFiles);
+        }
         let Some(i) = self.selected.filter(|&i| i < self.job.ops.len()) else { return };
+        if sc(Modifiers::COMMAND, Key::D) {
+            self.act.push(Action::Duplicate(i));
+        }
+        if ctx.input(|inp| inp.key_pressed(Key::Delete) || inp.key_pressed(Key::Backspace)) {
+            self.act.push(Action::Delete(i));
+        }
         let (dx, dy, shift) = ctx.input(|inp| {
-            let mut d = (0.0, 0.0);
-            if inp.key_pressed(egui::Key::ArrowLeft) {
-                d.0 -= 1.0;
-            }
-            if inp.key_pressed(egui::Key::ArrowRight) {
-                d.0 += 1.0;
-            }
-            if inp.key_pressed(egui::Key::ArrowUp) {
-                d.1 -= 1.0;
-            }
-            if inp.key_pressed(egui::Key::ArrowDown) {
-                d.1 += 1.0;
-            }
-            (d.0, d.1, inp.modifiers.shift)
+            let k = |key| if inp.key_pressed(key) { 1.0 } else { 0.0 };
+            (k(Key::ArrowRight) - k(Key::ArrowLeft), k(Key::ArrowDown) - k(Key::ArrowUp), inp.modifiers.shift)
         });
         if dx != 0.0 || dy != 0.0 {
             let step = if shift { 1.0 } else { P::PITCH_MM };
             let op = &mut self.job.ops[i];
-            op.x_mm = (((op.x_mm + dx * step).max(0.0)) * 1e6).round() / 1e6;
-            op.y_mm = (((op.y_mm + dy * step).max(0.0)) * 1e6).round() / 1e6;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            self.job.ops.remove(i);
-            self.selected = None;
+            op.x_mm = snap(op.x_mm + dx * step, P::PITCH_MM);
+            op.y_mm = snap(op.y_mm + dy * step, P::PITCH_MM);
         }
     }
 
-    fn live_reframe(&mut self) {
-        if !self.live_reframe || self.busy || self.running || self.pending_frame.is_some() {
-            return;
-        }
-        let Some(current) = self.framing else { return };
-        let Some((rect, fp)) = self.frame_target() else { return };
-        if rect == current {
-            // same rectangle already traced: the interlock is satisfied
-            if fp.is_some() {
-                self.framed_fp = fp;
-            }
-        } else if self.last_change.elapsed() > Duration::from_millis(250) {
-            self.start_frame();
+    /// Remember the laser settings of the selected item for the next new one.
+    fn track_laser(&mut self) {
+        if let Some(op) = self.selected.and_then(|i| self.job.ops.get(i)) {
+            self.laser = Laser {
+                power: op.power,
+                min_power: if op.is_grayscale() { op.min_power } else { self.laser.min_power },
+                depth: op.depth,
+                passes: op.passes,
+            };
         }
     }
 
@@ -1322,7 +2260,7 @@ impl App {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".into());
-        let dirty = if self.job != self.saved_job { " •" } else { "" };
+        let dirty = if self.dirty() { " •" } else { "" };
         let title = format!("{name}{dirty} — k4laser");
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1331,29 +2269,25 @@ impl App {
     }
 
     /// `K4LASER_SCREENSHOT=out.png k4laser gui job.toml`: render, save a screenshot, quit.
+    /// With `K4LASER_SELFTEST_SIM=1`, also connect to the simulator and frame the job.
     fn screenshot_self_test(&mut self, ctx: &egui::Context) {
-        let Some((_, frames)) = self.screenshot.as_mut() else { return };
+        let Some((path, frames)) = self.screenshot.as_mut() else { return };
         *frames += 1;
-        let n = *frames;
-        // K4LASER_SELFTEST_SIM=1: also connect to the simulator and frame the job
+        let (n, path) = (*frames, path.clone());
+        if n == 2 && !self.job.ops.is_empty() {
+            let i = std::env::var("K4LASER_SELECT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            self.selected = Some(i);
+        }
         if std::env::var_os("K4LASER_SELFTEST_SIM").is_some() {
             if n == 2 {
-                self.port_choice = Some(PortChoice::Simulator);
-                self.send(Cmd::Connect(PortChoice::Simulator, self.cfg.settings));
+                self.connect(PortChoice::Simulator);
             }
-            if n < 25
-                && self.connected.is_some()
-                && !self.busy
-                && self.framing.is_none()
-                && self.pending_frame.is_none()
-            {
-                self.selected = Some(1.min(self.job.ops.len().saturating_sub(1)));
-                self.start_frame();
+            if n < 25 && self.connected.is_some() && self.pending == 0 && !self.framing_active() {
+                self.start_frame(FrameScope::Job);
             }
         }
-        let Some((path, frames)) = self.screenshot.as_mut() else { return };
-        if *frames == 30 {
-            let (path, ctx2) = (path.clone(), ctx.clone());
+        if n == 30 {
+            let ctx2 = ctx.clone();
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
                 let [w, h] = img.size;
                 let raw: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
@@ -1364,7 +2298,7 @@ impl App {
                 ctx2.request_repaint();
             })));
         }
-        if *frames <= 30 {
+        if n <= 30 {
             ctx.request_repaint();
         }
     }
@@ -1374,37 +2308,54 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_events();
-        self.recompile_if_needed();
+        self.poll_ports();
+        self.handle_drops(&ctx);
         self.keyboard(&ctx);
+        self.apply_actions();
+        self.settle();
 
         egui::Panel::top("top").show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(5.0);
             self.top_bar(ui);
-            ui.add_space(2.0);
+            ui.add_space(3.0);
         });
-        egui::Panel::bottom("machine").show(ui, |ui| {
+        egui::Panel::bottom("actions").show(ui, |ui| {
             ui.add_space(6.0);
-            self.machine_panel(ui);
+            self.bottom_bar(ui);
             ui.add_space(4.0);
         });
-        egui::Panel::bottom("log").resizable(true).default_size(110.0).show(ui, |ui| self.log_panel(ui));
-        egui::Panel::left("ops").resizable(true).default_size(290.0).show(ui, |ui| {
-            ui.add_enabled_ui(!self.running, |ui| self.ops_panel(ui));
-        });
-        egui::Panel::right("props").resizable(true).default_size(330.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
-                ui.add_enabled_ui(!self.running, |ui| self.properties_panel(ui));
+        if self.show_log {
+            egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| self.log_panel(ui));
+        }
+        egui::Panel::right("side").resizable(true).default_size(380.0).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!self.running, |ui| {
+                self.items_panel(ui);
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("editor").auto_shrink([false, false]).show(ui, |ui| {
+                    self.editor(ui);
+                    ui.add_space(10.0);
+                    self.head_panel(ui);
+                });
             });
         });
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
 
         self.confirm_modal(&ctx);
-        self.recompile_if_needed();
+        self.discard_modal(&ctx);
+        self.apply_actions();
+        self.settle();
+        self.track_laser();
         self.live_reframe();
+        self.undo_tick(&ctx);
         self.update_title(&ctx);
         self.screenshot_self_test(&ctx);
-        if self.running || self.busy {
+        if self.running || self.pending > 0 {
             ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.framing.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300)); // live re-frame
+        } else if self.connected.is_none() {
+            ctx.request_repaint_after(Duration::from_secs(2));
         }
     }
 }
@@ -1425,7 +2376,7 @@ impl Drop for App {
 /// Append the system sans-serif face as a glyph fallback (arrows, symbols, accents).
 fn install_fallback_font(ctx: &egui::Context) {
     use usvg::fontdb;
-    let db = crate::sources::fontdb();
+    let db = sources::fontdb();
     let query = fontdb::Query { families: &[fontdb::Family::SansSerif], ..Default::default() };
     let Some(data) = db.query(&query).and_then(|id| db.with_face_data(id, |d, _| d.to_vec())) else { return };
     let mut fonts = egui::FontDefinitions::default();
@@ -1436,8 +2387,27 @@ fn install_fallback_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn mm_value(v: &mut f64, range: std::ops::RangeInclusive<f64>) -> egui::DragValue<'_> {
-    egui::DragValue::new(v).speed(P::PITCH_MM).range(range).fixed_decimals(2).suffix(" mm")
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(12.0);
+    ui.label(RichText::new(title).strong().size(15.0));
+    ui.add_space(2.0);
+}
+
+fn mm_drag(v: &mut f64, range: std::ops::RangeInclusive<f64>) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).speed(0.05).range(range).fixed_decimals(2).suffix(" mm")
+}
+
+fn dashed_rect(painter: &egui::Painter, r: egui::Rect, stroke: Stroke) {
+    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    painter.extend(egui::Shape::dashed_line(&pts, stroke, 5.0, 4.0));
+}
+
+fn timing_hint(t: &Timing) -> String {
+    format!(
+        "Learned from {} lines and batches timed on the machine. Delete {} to start over.",
+        t.frames(),
+        timing::path().display()
+    )
 }
 
 fn fmt_dur(d: Duration) -> String {
@@ -1449,164 +2419,12 @@ fn fmt_dur(d: Duration) -> String {
     }
 }
 
-/// Editor for the source fields; returns a file-picker request.
-fn source_editor(ui: &mut egui::Ui, src: &mut Source) -> Option<(&'static str, &'static [&'static str])> {
-    let mut pick = None;
-    egui::Grid::new("src").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| match src {
-        Source::Text(t) => {
-            ui.label("Text");
-            ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2).desired_width(200.0));
-            ui.end_row();
-            ui.label("Font").on_hover_text("Family, optionally followed by Bold / Italic / Light…");
-            font_picker(ui, &mut t.font);
-            ui.end_row();
-            ui.label("Size (em)");
-            ui.add(mm_value(&mut t.size_mm, 0.3..=76.0));
-            ui.end_row();
-            ui.label("Align");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut t.align, Align::Left, "left");
-                ui.selectable_value(&mut t.align, Align::Center, "center");
-                ui.selectable_value(&mut t.align, Align::Right, "right");
-            });
-            ui.end_row();
-        }
-        Source::Image(s) => {
-            path_row(
-                ui,
-                &mut s.path,
-                &mut pick,
-                ("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"]),
-            );
-            ui.label("Width");
-            ui.add(mm_value(&mut s.width_mm, 0.0..=200.0)).on_hover_text("0 = from height (or dpi)");
-            ui.end_row();
-            ui.label("Height");
-            ui.add(mm_value(&mut s.height_mm, 0.0..=200.0)).on_hover_text("0 = keep aspect ratio");
-            ui.end_row();
-            ui.label("DPI");
-            ui.add(egui::DragValue::new(&mut s.dpi).range(0.0..=2400.0))
-                .on_hover_text("used only when width and height are 0; 0 = 96");
-            ui.end_row();
-            ui.label("Threshold");
-            ui.add_enabled(!s.dither, egui::Slider::new(&mut s.threshold, 0..=255));
-            ui.end_row();
-            ui.label("");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut s.dither, "dither");
-                ui.checkbox(&mut s.invert, "invert");
-            });
-            ui.end_row();
-        }
-        Source::Svg(s) => {
-            path_row(ui, &mut s.path, &mut pick, ("SVG", &["svg", "svgz"]));
-            ui.label("Width");
-            ui.add(mm_value(&mut s.width_mm, 0.0..=200.0)).on_hover_text("0 = document size");
-            ui.end_row();
-            ui.label("Threshold");
-            ui.add(egui::Slider::new(&mut s.threshold, 0..=255));
-            ui.end_row();
-            ui.label("");
-            ui.checkbox(&mut s.invert, "invert (raster)");
-            ui.end_row();
-            ui.label("Tolerance");
-            ui.add(egui::DragValue::new(&mut s.tolerance_mm).speed(0.001).range(0.001..=0.5).suffix(" mm"))
-                .on_hover_text("vector mode: curve flattening");
-            ui.end_row();
-        }
-        Source::Qr(q) => {
-            ui.label("Data");
-            ui.add(egui::TextEdit::multiline(&mut q.data).desired_rows(2).desired_width(200.0));
-            ui.end_row();
-            ui.label("Module");
-            ui.add(mm_value(&mut q.module_mm, 0.05..=5.0));
-            ui.end_row();
-            ui.label("ECC");
-            ui.horizontal(|ui| {
-                for l in ["L", "M", "Q", "H"] {
-                    if ui.selectable_label(q.ecc.eq_ignore_ascii_case(l), l).clicked() {
-                        q.ecc = l.into();
-                    }
-                }
-            });
-            ui.end_row();
-        }
-        Source::Dxf(d) => {
-            path_row(ui, &mut d.path, &mut pick, ("DXF", &["dxf"]));
-            ui.label("Scale");
-            ui.add(egui::DragValue::new(&mut d.scale).speed(0.01).range(0.001..=1000.0));
-            ui.end_row();
-            ui.label("Layers");
-            let mut layers = d.layers.join(", ");
-            if ui.add(egui::TextEdit::singleline(&mut layers).hint_text("all")).changed() {
-                d.layers = layers.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-            }
-            ui.end_row();
-            ui.label("Tolerance");
-            ui.add(egui::DragValue::new(&mut d.tolerance_mm).speed(0.001).range(0.001..=0.5).suffix(" mm"));
-            ui.end_row();
-        }
-        Source::Shape(s) => {
-            ui.label("Shape");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.shape, ShapeKind::Rect, "rect");
-                ui.selectable_value(&mut s.shape, ShapeKind::Circle, "circle");
-                ui.selectable_value(&mut s.shape, ShapeKind::Cross, "cross");
-            });
-            ui.end_row();
-            ui.label(if s.shape == ShapeKind::Circle { "Diameter" } else { "Width" });
-            ui.add(mm_value(&mut s.width_mm, 0.05..=200.0));
-            ui.end_row();
-            if s.shape != ShapeKind::Circle {
-                ui.label("Height");
-                ui.add(mm_value(&mut s.height_mm, 0.0..=200.0));
-                ui.end_row();
-            }
-        }
-        Source::Ruler(r) => {
-            ui.label("Length");
-            ui.add(mm_value(&mut r.length_mm, 1.0..=200.0));
-            ui.end_row();
-            ui.label("Step");
-            ui.add(mm_value(&mut r.step_mm, 0.1..=10.0));
-            ui.end_row();
-            ui.label("");
-            ui.checkbox(&mut r.labels, "labels every 10 mm");
-            ui.end_row();
-            ui.label("Font");
-            font_picker(ui, &mut r.font);
-            ui.end_row();
-            ui.label("Label size");
-            ui.add(mm_value(&mut r.label_mm, 0.5..=10.0));
-            ui.end_row();
-        }
-    });
-    let _ = Mode::Raster;
-    pick
-}
-
-fn path_row(
-    ui: &mut egui::Ui,
-    path: &mut String,
-    pick: &mut Option<(&'static str, &'static [&'static str])>,
-    filter: (&'static str, &'static [&'static str]),
-) {
-    ui.label("File");
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(path).desired_width(150.0));
-        if ui.button("…").clicked() {
-            *pick = Some(filter);
-        }
-    });
-    ui.end_row();
-}
-
 fn font_picker(ui: &mut egui::Ui, font: &mut String) {
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(font).desired_width(150.0));
-        ui.menu_button("Fonts", |ui| {
+        ui.add(egui::TextEdit::singleline(font).desired_width(170.0));
+        ui.menu_button("▾", |ui| {
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for f in crate::sources::font_families() {
+                for f in sources::font_families() {
                     if ui.button(f).clicked() {
                         *font = f.clone();
                         ui.close();

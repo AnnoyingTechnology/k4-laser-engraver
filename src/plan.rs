@@ -95,7 +95,8 @@ impl Bitmap {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Geometry {
     Raster(Bitmap),
-    /// Segments relative to (x, y) of the operation.
+    /// Path segments of one pass, relative to (x, y) of the operation; passes
+    /// and laser on/off markers are added when encoding (`protocol::vector_stream`).
     Vector(Vec<Segment>),
 }
 
@@ -125,14 +126,23 @@ pub struct OpPlan {
 }
 
 impl OpPlan {
-    /// Data frames (raster rows / vector batches) of one pass.
+    /// Data frames (raster rows / vector batches) of the whole operation.
+    ///
+    /// Passes repeat inside one job, so that the head never leaves it between
+    /// passes: each raster row is sent `passes` times in a row, and the vector
+    /// paths are traced `passes` times over.
     pub fn frames(&self) -> Result<Vec<Vec<u8>>, P::ProtocolError> {
         match &*self.geometry {
-            Geometry::Raster(bm) => (0..bm.height)
-                .filter(|&y| bm.row(y).iter().any(|&b| b)) // vendor skips blank rows
-                .map(|y| P::raster_row(y as u16, &bm.packed_row(y), self.power, self.depth))
-                .collect(),
-            Geometry::Vector(segs) => segs
+            Geometry::Raster(bm) => {
+                let mut out = Vec::new();
+                for y in (0..bm.height).filter(|&y| bm.row(y).iter().any(|&b| b)) {
+                    // vendor skips blank rows
+                    let row = P::raster_row(y as u16, &bm.packed_row(y), self.power, self.depth)?;
+                    out.extend(std::iter::repeat_n(row, self.passes as usize));
+                }
+                Ok(out)
+            }
+            Geometry::Vector(segs) => P::vector_stream(segs, self.passes)
                 .chunks(P::VECTOR_MAX_SEGMENTS)
                 .map(|batch| P::vector_batch(batch, self.power, self.depth))
                 .collect(),
@@ -141,8 +151,10 @@ impl OpPlan {
 
     pub fn frame_count(&self) -> usize {
         match &*self.geometry {
-            Geometry::Raster(bm) => (0..bm.height).filter(|&y| bm.row(y).iter().any(|&b| b)).count(),
-            Geometry::Vector(segs) => segs.len().div_ceil(P::VECTOR_MAX_SEGMENTS),
+            Geometry::Raster(bm) => {
+                (0..bm.height).filter(|&y| bm.row(y).iter().any(|&b| b)).count() * self.passes as usize
+            }
+            Geometry::Vector(segs) => P::vector_stream_len(segs, self.passes).div_ceil(P::VECTOR_MAX_SEGMENTS),
         }
     }
 
@@ -211,7 +223,7 @@ pub struct Plan {
 
 impl Plan {
     pub fn data_frames(&self) -> usize {
-        self.ops.iter().map(|op| op.frame_count() * op.passes as usize).sum()
+        self.ops.iter().map(OpPlan::frame_count).sum()
     }
 
     pub fn bbox(&self) -> Option<Rect> {

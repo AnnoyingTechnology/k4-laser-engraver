@@ -15,7 +15,7 @@ use k4laser::machine::{Aborted, Control, Dir, Machine, Progress, hex};
 use k4laser::plan::{Plan, Rect};
 use k4laser::protocol as P;
 use k4laser::transport::{SerialPort, SimulatedPort, list_ports};
-use k4laser::{config, gui, preview};
+use k4laser::{config, gui, preview, timing};
 
 #[derive(Parser)]
 #[command(name = "k4laser", version, about = "Linux driver for K4-class USB mini laser engravers")]
@@ -318,6 +318,9 @@ fn run() -> Result<()> {
             let mut m = open_machine(&port, &cfg, verbose)?;
             connect(&mut m, &cfg)?;
             let (_, plan) = load_and_compile(&job, m.area_px)?;
+            let learned = timing::load();
+            println!("estimated duration: {}", learned.estimate(&plan));
+            m.timing = Some(learned);
             if !no_frame {
                 frame_until_enter(&mut m, plan.bbox().unwrap(), None)?;
             }
@@ -347,6 +350,11 @@ fn run() -> Result<()> {
             control.cancel.store(true, Ordering::SeqCst);
             let _ = watcher.join();
             println!();
+            if let Some(t) = &m.timing
+                && let Err(e) = timing::save(t)
+            {
+                eprintln!("warning: timing not saved: {e:#}");
+            }
             match res {
                 Ok(()) => println!("done in {:.0} s", t0.elapsed().as_secs_f64()),
                 Err(e) if e.is::<Aborted>() => bail!("interrupted: STOP sent"),
@@ -355,6 +363,7 @@ fn run() -> Result<()> {
         }
         Cmd::Simulate { job, output, trace } => {
             let (_, plan) = load_and_compile(&job, P::K4_AREA_PX)?;
+            println!("estimated duration on the machine: {}", timing::load().estimate(&plan));
             let (sim, elapsed) = simulate(&plan)?;
             let sent = sim.sent();
             let frames = P::split_frames(&sent)?;

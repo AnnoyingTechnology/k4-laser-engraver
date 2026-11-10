@@ -36,6 +36,14 @@ impl Mode {
             Mode::Vector => "vector",
         }
     }
+
+    /// Name shown to people: raster fills areas, vector follows paths.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Raster => "Fill",
+            Mode::Vector => "Line",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -64,6 +72,29 @@ impl Default for TextSrc {
     }
 }
 
+/// How an image's shades become burns (the machine itself is on/off per pixel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageProcess {
+    /// Black and white: pixels darker than `threshold` burn.
+    Threshold,
+    /// Floyd–Steinberg error diffusion: shades become dot density.
+    #[default]
+    Dither,
+    /// `levels` tones, one pass each, burnt at a power scaled to the tone.
+    Grayscale,
+}
+
+impl ImageProcess {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageProcess::Threshold => "Black & white",
+            ImageProcess::Dither => "Dither",
+            ImageProcess::Grayscale => "Grayscale",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImageSrc {
@@ -72,8 +103,14 @@ pub struct ImageSrc {
     pub width_mm: f64,
     pub height_mm: f64,
     pub dpi: f64,
+    pub process: ImageProcess,
     pub threshold: u8,
-    pub dither: bool,
+    /// -100..100
+    pub brightness: f64,
+    /// -100..100
+    pub contrast: f64,
+    /// Grayscale tones (2..16).
+    pub levels: u8,
     pub invert: bool,
 }
 
@@ -84,8 +121,11 @@ impl Default for ImageSrc {
             width_mm: 30.0,
             height_mm: 0.0,
             dpi: 0.0,
+            process: ImageProcess::Dither,
             threshold: 128,
-            dither: false,
+            brightness: 0.0,
+            contrast: 0.0,
+            levels: 6,
             invert: false,
         }
     }
@@ -231,6 +271,57 @@ impl Source {
         }
     }
 
+    /// Name shown to people.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Source::Text(_) => "Text",
+            Source::Image(_) => "Image",
+            Source::Svg(_) => "SVG",
+            Source::Qr(_) => "QR code",
+            Source::Dxf(_) => "DXF",
+            Source::Shape(s) => match s.shape {
+                ShapeKind::Rect => "Rectangle",
+                ShapeKind::Circle => "Circle",
+                ShapeKind::Cross => "Cross",
+            },
+            Source::Ruler(_) => "Ruler",
+        }
+    }
+
+    /// Whether width and height can only scale together.
+    pub fn keeps_aspect(&self) -> bool {
+        match self {
+            Source::Image(_) => false,
+            Source::Shape(s) => s.shape == ShapeKind::Circle,
+            _ => true,
+        }
+    }
+
+    /// Resize by (fx, fy), given the current artwork size in mm (source axes).
+    pub fn scale(&mut self, fx: f64, fy: f64, size_mm: (f64, f64), base_dir: &Path) -> Result<()> {
+        let fy = if self.keeps_aspect() { fx } else { fy };
+        let r = |v: f64| (v * 1e4).round() / 1e4;
+        match self {
+            Source::Image(s) => {
+                s.width_mm = r(size_mm.0 * fx);
+                s.height_mm = r(size_mm.1 * fy);
+            }
+            Source::Svg(s) => {
+                let w = if s.width_mm > 0.0 { s.width_mm } else { svg_width_mm(&resolve(&s.path, base_dir))? };
+                s.width_mm = r(w * fx);
+            }
+            Source::Dxf(d) => d.scale = (d.scale * fx * 1e6).round() / 1e6,
+            Source::Text(t) => t.size_mm = r(t.size_mm * fx),
+            Source::Qr(q) => q.module_mm = r((q.module_mm * fx).max(PITCH_MM)),
+            Source::Shape(s) => {
+                s.width_mm = r(s.width_mm * fx);
+                s.height_mm = r(s.height_mm * fy);
+            }
+            Source::Ruler(rl) => rl.length_mm = r(rl.length_mm * fx),
+        }
+        Ok(())
+    }
+
     pub fn path(&self) -> Option<&str> {
         match self {
             Source::Image(s) => Some(&s.path),
@@ -285,6 +376,8 @@ pub fn substitute(s: &str, vars: &std::collections::BTreeMap<String, String>) ->
 #[derive(Debug, Clone)]
 pub enum Artwork {
     Raster(Bitmap),
+    /// Grayscale tones, lightest first; same size, disjoint pixels.
+    Levels(Vec<Bitmap>),
     /// Polylines in mm, Y down, bounding box at the origin.
     Vector(Vec<Polyline>),
 }
@@ -401,9 +494,9 @@ pub fn font_families() -> &'static [String] {
     })
 }
 
-fn svg_options(resources_dir: Option<PathBuf>) -> usvg::Options<'static> {
-    let mut opt =
-        usvg::Options { fontdb: fontdb(), dpi: (25.4 * PX_PER_MM) as f32, resources_dir, ..Default::default() };
+/// `dpi` converts absolute units (mm, in, pt) to user units.
+fn svg_options(resources_dir: Option<PathBuf>, dpi: f32) -> usvg::Options<'static> {
+    let mut opt = usvg::Options { fontdb: fontdb(), dpi, resources_dir, ..Default::default() };
     opt.font_family = "sans-serif".into();
     opt
 }
@@ -468,7 +561,7 @@ fn text_tree(t: &TextSrc) -> Result<(usvg::Tree, Vec<String>)> {
         f.weight,
         if f.italic { "italic" } else { "normal" }
     );
-    let tree = usvg::Tree::from_str(&svg, &svg_options(None)).context("text layout")?;
+    let tree = usvg::Tree::from_str(&svg, &svg_options(None, (25.4 * PX_PER_MM) as f32)).context("text layout")?;
     Ok((tree, notes))
 }
 
@@ -601,13 +694,25 @@ pub fn text_polylines(t: &TextSrc) -> Result<(Vec<Polyline>, Vec<String>)> {
 
 // ---------------------------------------------------------------- svg
 
+/// SVG user units are CSS px (1/96 in), as in browsers and Inkscape.
+const SVG_PX_MM: f64 = 25.4 / 96.0;
+
+fn parse_svg(path: &Path) -> Result<usvg::Tree> {
+    let data = std::fs::read(path).with_context(|| format!("{}", path.display()))?;
+    usvg::Tree::from_data(&data, &svg_options(path.parent().map(Path::to_path_buf), 96.0))
+        .with_context(|| format!("{}", path.display()))
+}
+
+/// Document width of an SVG file, mm.
+pub fn svg_width_mm(path: &Path) -> Result<f64> {
+    Ok(parse_svg(path)?.size().width() as f64 * SVG_PX_MM)
+}
+
+/// Tree and its scale from user units to machine px.
 fn load_svg(s: &SvgSrc, base_dir: &Path) -> Result<(usvg::Tree, f64)> {
-    let path = resolve(&s.path, base_dir);
-    let data = std::fs::read(&path).with_context(|| format!("{}", path.display()))?;
-    let tree = usvg::Tree::from_data(&data, &svg_options(path.parent().map(Path::to_path_buf)))
-        .with_context(|| format!("{}", path.display()))?;
+    let tree = parse_svg(&resolve(&s.path, base_dir))?;
     let w = tree.size().width() as f64;
-    let scale = if s.width_mm > 0.0 { mm2px(s.width_mm) as f64 / w } else { 1.0 };
+    let scale = if s.width_mm > 0.0 { mm2px(s.width_mm) as f64 / w } else { SVG_PX_MM * PX_PER_MM };
     Ok((tree, scale))
 }
 
@@ -634,28 +739,9 @@ fn svg_vector(s: &SvgSrc, base_dir: &Path) -> Result<Rendered> {
 // --------------------------------------------------------------- images
 
 fn image(s: &ImageSrc, base_dir: &Path) -> Result<Rendered> {
-    use image::{ImageDecoder, ImageReader, imageops};
-
     let path = resolve(&s.path, base_dir);
-    let mut decoder = ImageReader::open(&path)
-        .with_context(|| format!("{}", path.display()))?
-        .with_guessed_format()?
-        .into_decoder()
-        .with_context(|| format!("{}", path.display()))?;
-    let orientation = decoder.orientation().ok();
-    let mut img = image::DynamicImage::from_decoder(decoder)?;
-    if let Some(o) = orientation {
-        img.apply_orientation(o);
-    }
-    // composite on white, then luma
-    let rgba = img.to_rgba8();
-    let gray = image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
-        let p = rgba.get_pixel(x, y).0;
-        let a = p[3] as f32 / 255.0;
-        let l = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
-        image::Luma([(l * a + 255.0 * (1.0 - a)).round() as u8])
-    });
-    let (iw, ih) = (gray.width() as f64, gray.height() as f64);
+    let (iw, ih) = image_size(&path).with_context(|| format!("{}", path.display()))?;
+    let (iw, ih) = (iw as f64, ih as f64);
     let mut notes = Vec::new();
     let (mut w_mm, mut h_mm) = (s.width_mm, s.height_mm);
     if w_mm <= 0.0 && h_mm <= 0.0 {
@@ -669,29 +755,106 @@ fn image(s: &ImageSrc, base_dir: &Path) -> Result<Rendered> {
         w_mm = h_mm * iw / ih;
     }
     let (w, h) = (mm2px(w_mm).max(1) as u32, mm2px(h_mm).max(1) as u32);
-    let small = imageops::resize(&gray, w, h, imageops::FilterType::Lanczos3);
-    let mut bm = if s.dither {
-        floyd_steinberg(&small)
-    } else {
-        Bitmap::from_fn(w as usize, h as usize, |x, y| small.get_pixel(x as u32, y as u32).0[0] < s.threshold)
+    let planes = image_planes(&path, w, h)?;
+    // darkness 0..1 after brightness, contrast and invert, masked by coverage
+    let contrast = (1.0 + s.contrast.clamp(-100.0, 100.0) / 100.0) as f32;
+    let brightness = (s.brightness.clamp(-100.0, 100.0) * 1.28) as f32;
+    let dark: Vec<f32> = planes
+        .luma
+        .pixels()
+        .zip(planes.alpha.pixels())
+        .map(|(l, a)| {
+            let v = ((l.0[0] as f32 - 128.0) * contrast + 128.0 + brightness).clamp(0.0, 255.0);
+            let d = 1.0 - v / 255.0;
+            (if s.invert { 1.0 - d } else { d }) * (a.0[0] as f32 / 255.0)
+        })
+        .collect();
+    let (wu, hu) = (w as usize, h as usize);
+    let art = match s.process {
+        ImageProcess::Threshold => {
+            let t = 1.0 - s.threshold as f32 / 255.0;
+            Artwork::Raster(Bitmap::from_fn(wu, hu, |x, y| dark[y * wu + x] > t))
+        }
+        ImageProcess::Dither => Artwork::Raster(floyd_steinberg(wu, hu, &dark)),
+        ImageProcess::Grayscale => {
+            let n = s.levels.clamp(2, 16) as usize;
+            let tone = |x: usize, y: usize| (dark[y * wu + x] * n as f32).round() as usize;
+            notes.push(format!("{n} tones: one pass per tone, power scaled from min to max"));
+            Artwork::Levels((1..=n).map(|k| Bitmap::from_fn(wu, hu, |x, y| tone(x, y) == k)).collect())
+        }
     };
-    if s.invert {
-        bm.data.iter_mut().for_each(|b| *b = !*b);
-    }
     notes.push(format!("{w_mm:.2} x {h_mm:.2} mm from {iw}x{ih} px"));
-    Ok(Rendered { art: Artwork::Raster(bm), notes })
+    Ok(Rendered { art, notes })
 }
 
-fn floyd_steinberg(img: &image::GrayImage) -> Bitmap {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let mut buf: Vec<f32> = img.pixels().map(|p| p.0[0] as f32).collect();
+/// Luma composited on white, and coverage, both resized to the burn size.
+struct Planes {
+    luma: image::GrayImage,
+    alpha: image::GrayImage,
+}
+
+/// Decoding and resampling dominate image rendering; tone settings change far
+/// more often than the file or the size, so the planes are kept for reuse.
+fn image_planes(path: &Path, w: u32, h: u32) -> Result<Arc<Planes>> {
+    use image::{ImageDecoder, ImageReader, imageops};
+    type Key = (PathBuf, Option<std::time::SystemTime>, u32, u32);
+    static CACHE: std::sync::Mutex<Vec<(Key, Arc<Planes>)>> = std::sync::Mutex::new(Vec::new());
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let key = (path.to_path_buf(), mtime, w, h);
+    if let Some(p) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone()) {
+        return Ok(p);
+    }
+    let mut decoder = ImageReader::open(path)
+        .with_context(|| format!("{}", path.display()))?
+        .with_guessed_format()?
+        .into_decoder()
+        .with_context(|| format!("{}", path.display()))?;
+    let orientation = decoder.orientation().ok();
+    let mut img = image::DynamicImage::from_decoder(decoder)?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    // transparent areas never burn, even inverted
+    let rgba = img.to_rgba8();
+    let luma = image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba.get_pixel(x, y).0;
+        let a = p[3] as f32 / 255.0;
+        let l = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        image::Luma([(l * a + 255.0 * (1.0 - a)).round() as u8])
+    });
+    let alpha = image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| image::Luma([rgba.get_pixel(x, y).0[3]]));
+    let planes = Arc::new(Planes {
+        luma: imageops::resize(&luma, w, h, imageops::FilterType::Lanczos3),
+        alpha: imageops::resize(&alpha, w, h, imageops::FilterType::Triangle),
+    });
+    let mut cache = CACHE.lock().unwrap();
+    cache.push((key, planes.clone()));
+    if cache.len() > 4 {
+        cache.remove(0);
+    }
+    Ok(planes)
+}
+
+/// Pixel size of an image file, after EXIF orientation.
+pub fn image_size(path: &Path) -> Result<(u32, u32)> {
+    use image::metadata::Orientation as O;
+    use image::{ImageDecoder, ImageReader};
+    let mut decoder = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let (w, h) = decoder.dimensions();
+    let turned = matches!(decoder.orientation(), Ok(O::Rotate90 | O::Rotate270 | O::Rotate90FlipH | O::Rotate270FlipH));
+    Ok(if turned { (h, w) } else { (w, h) })
+}
+
+/// Error diffusion on darkness values (0 = white, 1 = burn).
+fn floyd_steinberg(w: usize, h: usize, dark: &[f32]) -> Bitmap {
+    let mut buf = dark.to_vec();
     let mut bm = Bitmap::new(w, h);
     for y in 0..h {
         for x in 0..w {
             let old = buf[y * w + x];
-            let new = if old < 128.0 { 0.0 } else { 255.0 };
-            bm.set(x, y, new == 0.0);
-            let err = old - new;
+            let burn = old >= 0.5;
+            bm.set(x, y, burn);
+            let err = old - if burn { 1.0 } else { 0.0 };
             let mut spread = |dx: isize, dy: usize, f: f32| {
                 let xx = x as isize + dx;
                 if xx >= 0 && (xx as usize) < w && y + dy < h {

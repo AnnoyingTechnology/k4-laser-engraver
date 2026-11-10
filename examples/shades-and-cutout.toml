@@ -1,0 +1,43 @@
+# Grayscale image, an SVG part cut out with three outlines, and a text label.
+# Grayscale burns one pass per tone, from min_power (lightest) to power (darkest).
+# Outlines are concentric copies of the path, offset outward so the part keeps its size.
+
+[[op]]
+x_mm = 4.0
+y_mm = 4.0
+power = 80.0
+min_power = 10.0
+depth = 20
+
+[op.source]
+type = "image"
+path = "assets/gradient.png"
+width_mm = 36.0
+height_mm = 25.2
+process = "grayscale"
+levels = 6
+
+[[op]]
+mode = "vector"
+x_mm = 46.0
+y_mm = 6.0
+power = 100.0
+depth = 60
+passes = 3
+outlines = 3
+outline_spacing_mm = 0.3
+
+[op.source]
+type = "svg"
+path = "assets/part.svg"
+
+[[op]]
+x_mm = 6.0
+y_mm = 40.0
+power = 60.0
+depth = 15
+
+[op.source]
+type = "text"
+text = "ASSET 0042"
+size_mm = 6.0

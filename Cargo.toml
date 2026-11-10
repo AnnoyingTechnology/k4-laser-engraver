@@ -17,6 +17,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard", "accesskit"] }
 # eframe leaves winit's defaults off; they provide dlopen'ed Wayland and client-side decorations.
 winit = "0.30.13"
+i_overlay = { version = "9.1.0", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] }
 libc = "0.2.191"
 png = "0.18.1"

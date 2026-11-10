@@ -15,24 +15,30 @@ the machine will receive.
 It is a single self-contained binary, with no Python, Java, Wine or runtime
 to install.
 
-![k4laser GUI: asset-tag job framed on the simulator](docs/screenshot.png)
+![k4laser GUI: grayscale image, SVG cut-out with three outlines and a text label, framed on the simulator](docs/screenshot.png)
 
 ## Features
 
 - **Exact framing for alignment.** The head traces the job's bounding box at
   standby (minimum) power, so you can position the workpiece precisely. It can
-  frame the whole job or one operation, and can follow your edits live while
-  framing. A burn is enabled only after the current geometry has been framed.
+  frame the whole job or one item, and follows your edits while framing.
 - **Job files, not just images.** A job is a TOML file of operations. Each
   operation has a position in mm, a power, a depth, a pass count and a source:
   - text: system fonts, multi-line, raster or vector outlines
-  - image: PNG, JPEG, BMP, GIF, WebP or TIFF; threshold or Floyd–Steinberg
-  - SVG: raster or vector
+  - image: PNG, JPEG, BMP, GIF, WebP or TIFF; black & white, dither, or
+    grayscale (one pass per tone, power scaled from a minimum to a maximum);
+    brightness, contrast, invert
+  - SVG: fill (raster) or line (vector)
   - DXF: lines, polylines with bulges, arcs, circles, ellipses, splines and
     nested blocks; `$INSUNITS` honoured; layer filter
   - QR code: modules snapped to whole machine pixels
   - shapes: rectangle, circle, cross
   - ruler: a scale-calibration ruler
+- **Cutting.** Line mode follows the paths. Passes repeat an item for a deeper
+  cut, within one job so that every pass lands on the first. Outlines add concentric copies of the path, like the walls of a 3D
+  print, offset outward (a cut-out part keeps its size), inward (a hole keeps
+  its size) or centred.
+- **Rotate and mirror** any item by quarter turns.
 - **Variables.** `${id}` placeholders in text, QR data and paths. Burn a
   series with `--set id=PUMP-0043`.
 - **Simulator and stream replay.** `simulate` streams the job to a simulated
@@ -40,9 +46,20 @@ to install.
   from the design. `decode` turns a byte trace into readable frames.
 - **Calibration.** `testgrid` writes a power × depth matrix job. The ruler
   source checks the scale with calipers.
-- **GUI.** Canvas with a mm grid; drag operations (0.05 mm snap, 1 mm with
-  Ctrl), nudge them with the arrow keys, and edit properties. Also: jog, home,
-  pause/resume, progress with ETA, and a big STOP button (Esc).
+- **Duration estimates** before you start, learned from your machine. Every
+  line and batch of a real job is timed, and a small linear model per mode
+  (per line, travel, burnt pixels, burnt pixels × burn time) predicts the next
+  job. The first raster job and the first vector job calibrate it, and a test
+  grid covers many burn times at once. The model is kept in
+  `~/.local/state/k4laser/timing.toml`; delete that file to start over.
+- **GUI.** Add a file (or drop it on the window under X11), and it appears
+  centred on the bed. The bed always fits the window. Drag an item to move it
+  (0.05 mm snap, 1 mm with Shift) and its corners to resize it; nudge it with
+  the arrow keys. The editor on the right holds everything about the selected
+  item: mode, image processing, power, burn time, passes, outlines, size and
+  position. STOP (Esc), Frame and Start sit at the bottom, with the reason
+  when Start is not available, and the estimated duration. Undo/redo,
+  pause/resume, progress with ETA.
 - **CLI.** Every machine action is scriptable.
 
 ## Safety model
@@ -58,16 +75,20 @@ What the software does:
   serial port; `k4laser` opens only the port you name.
 - **It holds the port exclusively** (`flock` + `TIOCEXCL`). It refuses a port
   that another process holds, and names that process.
-- **Frame before burn.** In the GUI, Burn stays disabled until the current
-  geometry and position have been framed. Changing power or depth does not
-  require a new framing; moving or editing geometry does.
-- **Explicit confirmation.** The GUI uses a modal with a checkbox; the CLI
-  asks you to type `BURN` (or pass `--yes`).
+- **The GUI never moves on connect.** Connecting sends the handshake, the
+  settings and the model query only; the head homes before its first move.
+  The GUI connects on its own only to the port you picked before, when that
+  port appears. CLI commands that move the head home it first.
+- **Explicit confirmation.** The GUI asks before every job, and warns when
+  the geometry or position changed since the last framing (changing power or
+  burn time does not count). The CLI asks you to type `BURN` (or pass `--yes`).
 - **Stop on every failure path.** `STOP` is sent on Esc, Ctrl-C, any error
   or timeout, and when the program exits during framing.
   Pause is held by the host, so `STOP` always gets through.
-- After a job the head position counts as unknown, and the head homes before
-  the next positioning.
+- After a job the head is taken to be back at the job origin, as the vendor
+  software assumes; line jobs return there explicitly. After STOP or an error
+  the position counts as unknown, and the head homes before the next move.
+  Frame again before burning after an abort.
 
 ## Install
 
@@ -84,6 +105,9 @@ install -m 755 k4laser-x86_64-linux ~/.local/bin/k4laser
 
 The binary needs glibc and a desktop session (Wayland or X11, OpenGL). It
 finds system fonts on its own. File dialogs use the XDG desktop portal.
+Dropping files on the window works under X11 only, because the windowing
+library does not support it on Wayland yet; use "Add file…", or start the GUI
+through XWayland with `WAYLAND_DISPLAY= k4laser`.
 
 ### From source
 
@@ -184,12 +208,18 @@ ecc = "M"
 | `type` | Modes | Main keys |
 |---|---|---|
 | `text` | raster, vector | `text`, `font`, `size_mm`, `align` |
-| `image` | raster | `path`, `width_mm`, `height_mm`, `dpi`, `threshold`, `dither`, `invert` |
-| `svg` | raster, vector | `path`, `width_mm`, `threshold`, `invert`, `tolerance_mm` |
+| `image` | raster | `path`, `width_mm`, `height_mm`, `dpi`, `process` (threshold/dither/grayscale), `threshold`, `brightness`, `contrast`, `levels`, `invert` |
+| `svg` | raster, vector | `path`, `width_mm` (default: the document size; px are CSS px), `threshold`, `invert`, `tolerance_mm` |
 | `dxf` | vector | `path`, `scale`, `layers`, `tolerance_mm` |
 | `qr` | raster | `data`, `module_mm`, `ecc` (L/M/Q/H) |
 | `shape` | vector, raster | `shape` (rect/circle/cross), `width_mm`, `height_mm` |
 | `ruler` | vector | `length_mm`, `step_mm`, `labels`, `font`, `label_mm` |
+
+Operation keys besides the source: `name`, `mode`, `x_mm`, `y_mm`, `power`,
+`min_power` (grayscale: lightest tone), `depth` (shown as "burn time"),
+`passes`, `outlines`, `outline_spacing_mm`, `outline_side`
+(outside/inside/centered), `rotate` (0/90/180/270, clockwise), `mirror`,
+`enabled`.
 
 Relative paths are resolved from the job file's directory. Unknown keys are
 rejected, so a typo cannot silently fall back to a default. See
@@ -197,22 +227,26 @@ rejected, so a typo cannot silently fall back to a default. See
 
 ### Typical workflow
 
-1. Burn `testgrid` on scrap of the material and pick the power and depth.
+1. Burn a test grid (GUI: Add ▾ → Test grid; CLI: `testgrid`) on scrap of
+   the material, and pick the power and burn time of the best square.
 2. Build the job in the GUI, or write the TOML by hand.
-3. Check it with `simulate`, which shows exactly what the machine will burn.
+3. Optionally check it with `simulate`, which shows exactly what the machine
+   will burn.
 4. Frame it, and align the workpiece to the red trace.
-5. Burn.
+5. Start.
 
 ## Hardware status
 
 The protocol was reconstructed from the vendor application; see
 [PROTOCOL.md](PROTOCOL.md). The test suite checks the byte stream against the
-simulator: layout, ordering, resend on NAK, cancel, and framing. Validation on
-real hardware is in progress. These points are still unconfirmed:
+simulator: layout, ordering, resend on NAK, cancel, framing, and laser-off
+moves between vector paths. Validation on real hardware is in progress. These
+points are still unconfirmed:
 
 - whether `START` coordinates are absolute or relative to the head
 - the unit of `depth`
-- what the machine does after `STOP`
+- what the machine does after `STOP`, and where a fill job leaves the head
+- whether a fill row sent twice is burnt twice in place (fill passes)
 - what the hidden `0xFD`/`0xFE` commands do (`k4laser aux on|off`; possibly an
   auxiliary output such as the fan)
 
@@ -224,7 +258,7 @@ description of what the machine did is the most useful thing to send.
 ```sh
 cargo test                  # unit + end-to-end tests against the simulator
 cargo clippy --all-targets
-K4LASER_SELFTEST_SIM=1 K4LASER_SCREENSHOT=/tmp/gui.png cargo run -- gui examples/asset-tag.toml
+K4LASER_SELFTEST_SIM=1 K4LASER_SCREENSHOT=/tmp/gui.png cargo run -- gui examples/shades-and-cutout.toml
 ```
 
 ## Keywords

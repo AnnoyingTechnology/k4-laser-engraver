@@ -185,6 +185,48 @@ pub fn raster_row(row: u16, bits: &[u8], power: u16, depth: u16) -> Result<Vec<u
 /// A machine-pixel segment (x0, y0, x1, y1), relative to the job origin.
 pub type Segment = [u16; 4];
 
+/// Marker segments in the vector stream. The vendor G-code import maps `M3`
+/// (laser on) to 50001 and `M5` (laser off) to 50000.
+pub const VECTOR_LASER_ON: Segment = [0xC351; 4];
+pub const VECTOR_LASER_OFF: Segment = [0xC350; 4];
+
+/// The segment list of a vector job: the paths `passes` times over, each path
+/// between laser-on and laser-off markers and reached by a laser-off move,
+/// then a laser-off move back to the job origin. Without the markers the
+/// machine burns the moves between paths.
+///
+/// Same layout as the vendor (`ON path OFF move ON path … OFF`), except that
+/// the vendor reaches the first path with the laser on, and leaves the head
+/// where the last path ends.
+pub fn vector_stream(paths: &[Segment], passes: u32) -> Vec<Segment> {
+    let mut out = Vec::with_capacity(vector_stream_len(paths, passes));
+    let mut at = None;
+    for &s in paths.iter().cycle().take(paths.len() * passes as usize) {
+        if at != Some((s[0], s[1])) {
+            let (x, y) = at.unwrap_or((s[0], s[1]));
+            out.extend([VECTOR_LASER_OFF, [x, y, s[0], s[1]], VECTOR_LASER_ON]);
+        }
+        out.push(s);
+        at = Some((s[2], s[3]));
+    }
+    if let Some((x, y)) = at {
+        out.extend([VECTOR_LASER_OFF, [x, y, 0, 0]]);
+    }
+    out
+}
+
+/// `vector_stream(paths, passes).len()`, without building it.
+pub fn vector_stream_len(paths: &[Segment], passes: u32) -> usize {
+    let (Some(first), Some(last), n) = (paths.first(), paths.last(), passes as usize) else { return 0 };
+    if n == 0 {
+        return 0;
+    }
+    let breaks = paths.windows(2).filter(|w| w[0][2..] != w[1][..2]).count();
+    let wrap = (last[2..] != first[..2]) as usize; // from the last path back to the first
+    let starts = 1 + n * breaks + (n - 1) * wrap;
+    paths.len() * n + 3 * starts + 2
+}
+
 /// Up to 80 segments relative to the job origin.
 pub fn vector_batch(segments: &[Segment], power: u16, depth: u16) -> Result<Vec<u8>> {
     check_power_depth(power, depth)?;
@@ -423,7 +465,9 @@ impl Frame {
                 format!("{name} row={row} power={power} depth={depth} bytes={} burn_px={burn}", bits.len())
             }
             Fields::Vector { depth, power, segments } => {
-                format!("{name} power={power} depth={depth} segments={}", segments.len())
+                let count = |m| segments.iter().filter(|&&s| s == m).count();
+                let (on, off) = (count(VECTOR_LASER_ON), count(VECTOR_LASER_OFF));
+                format!("{name} power={power} depth={depth} segments={} on={on} off={off}", segments.len() - on - off)
             }
             Fields::Start { x, y } => format!("{name} x={x} y={y}"),
             Fields::MoveRel { dx, dy } => format!("{name} dx={dx} dy={dy}"),
@@ -504,6 +548,29 @@ mod tests {
         let mut too_many = segs.clone();
         too_many.push([0, 0, 1, 1]);
         assert!(vector_batch(&too_many, 500, 20).is_err());
+    }
+
+    #[test]
+    fn vector_stream_moves_with_the_laser_off() {
+        let (on, off) = (VECTOR_LASER_ON, VECTOR_LASER_OFF);
+        // two joined segments, then a separate one
+        let paths = [[10, 10, 20, 10], [20, 10, 20, 20], [50, 50, 60, 50]];
+        let pass = [on, paths[0], paths[1], off, [20, 20, 50, 50], on, paths[2], off];
+        let s = vector_stream(&paths, 1);
+        assert_eq!(s, [&[off, [10, 10, 10, 10]][..], &pass, &[[60, 50, 0, 0]]].concat());
+        // the second pass starts from where the first ended
+        let s2 = vector_stream(&paths, 2);
+        assert_eq!(s2, [&[off, [10, 10, 10, 10]][..], &pass, &[[60, 50, 10, 10]], &pass, &[[60, 50, 0, 0]]].concat());
+        // a closed loop runs on without a stop
+        let square = [[0, 0, 9, 0], [9, 0, 9, 9], [9, 9, 0, 9], [0, 9, 0, 0]];
+        assert_eq!(vector_stream(&square, 2).len(), 3 + 8 + 2);
+        for n in 0..4 {
+            assert_eq!(vector_stream_len(&paths, n), vector_stream(&paths, n).len());
+            assert_eq!(vector_stream_len(&square, n), vector_stream(&square, n).len());
+        }
+        assert!(vector_stream(&[], 2).is_empty() && vector_stream_len(&[], 2) == 0);
+        let fr = vector_batch(&s[..1], 500, 20).unwrap();
+        assert_eq!(&fr[7..], &[0xC3, 0x50, 0xC3, 0x50, 0xC3, 0x50, 0xC3, 0x50]);
     }
 
     #[test]
