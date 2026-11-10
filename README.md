@@ -1,5 +1,7 @@
 # k4laser — Linux software for K4 USB mini laser engravers
 
+![k4laser GUI: a dithered image placed on the 80 × 76 mm bed, with the item editor for mode, power, burn time, passes, size and position](docs/screenshot.png)
+
 `k4laser` is a native Linux driver, GUI and CLI for **K4-class desktop mini
 laser engravers**. These machines have an 80 × 76 mm work area, 0.05 mm
 steps (508 dpi), a CH340 USB-serial port, and ship with the Windows-only
@@ -14,8 +16,6 @@ the machine will receive.
 
 It is a single self-contained binary, with no Python, Java, Wine or runtime
 to install.
-
-![k4laser GUI: grayscale image, SVG cut-out with three outlines and a text label, framed on the simulator](docs/screenshot.png)
 
 ## Features
 
